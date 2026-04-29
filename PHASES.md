@@ -399,3 +399,102 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **Sign-in log queries against tenants with very high signal volume time out.** Mitigation: query is bounded by date range with sane defaults; cursor-based; surface the cursor in the URL so users can resume.
 
 ---
+
+## Phase 5 — Tenants domain
+
+**Goal:** Onboard / offboard customer tenants as a first-class flow, keep the tenant catalogue accurate, and surface the cross-tenant grids (alignment, drift, BPA, compliance, domain health) that are the most-used part of CIPP. This is the phase that makes the platform **multi-customer-tenant in earnest** rather than a single-tenant proof-of-concept.
+
+### Scope
+
+#### Onboarding saga
+
+- A code-defined saga (`TenantOnboardingSaga`) persisted to `graph.sagas`, with steps:
+  1. Validate inputs (target tenant id, GDAP invite role set, MSP user initiating).
+  2. Create GDAP invite via Partner Center with the requested role set.
+  3. Wait for invite acceptance (saga sleeps; resumed by a webhook receiver or a 1-min poll).
+  4. Map invited GDAP roles to our internal roles per the MSP's role-mapping table.
+  5. SAM bootstrap: register the platform's confidential-client app in the customer tenant if not already trusted; verify cert-based auth round-trip.
+  6. Initial warmer kick across the standard resource set (tenants → users → groups → devices → CA policies).
+  7. Run baseline Standards in **Report-only** mode; persist baseline.
+  8. Notify MSP via UI + email; mark customer tenant `Active`.
+- Failure paths at each step have explicit compensation:
+  - GDAP invite stuck → notify, surface re-send affordance, do **not** auto-retry (avoid invite spam).
+  - Cert bootstrap failure → flag as `Onboarding-Blocked`, link to remediation playbook.
+  - Initial warm failure → tenant stays `Onboarding-Warming` and the warmer retries; UI surfaces the partial state.
+
+#### Offboarding saga
+
+- Reverse flow: revoke GDAP, delete projection rows for that customer tenant under the MSP, archive audit log shards, retain the audit log itself per retention policy, mark `Offboarded` (soft-deleted with retention).
+- Hard-delete is a separate flow gated by SuperAdmin + a ticket id, with a 30-day cooling-off period.
+
+#### Tenant catalogue + GDAP relationship sync
+
+- `tenants.customer_tenants` — one row per customer tenant the MSP has any relationship with.
+- `tenants.gdap_relationships` — refreshed from Partner Center every 15 min via Hangfire.
+- `tenants.gdap_role_mappings` — MSP-defined map from Partner Center GDAP roles to our internal four-role policy plus per-feature scopes.
+- A customer-tenant detail page summarising: status, GDAP roles, last warmer run per resource, drift score (Phase 6 plugs in), open incidents (Phase 7 plugs in).
+
+#### Cross-tenant grids
+
+- All-tenants list (the home page after sign-in).
+- All-tenants alignment: per-tenant pass/fail per Standard (Phase 6 fills in the data; Phase 5 ships the grid frame).
+- All-tenants drift: per-tenant deviation count and last-seen drift event (Phase 6 fills in).
+- All-tenants BPA: per-tenant pass/fail per BPA rule (Phase 10 fills in via the BPA → Standards bridge).
+- All-tenants compliance: per-tenant secure score, MFA coverage, conditional-access posture summary (Phase 7 fills in).
+- All-tenants domain health: per-tenant DNS / DKIM / SPF / DMARC / MX state.
+- Each grid: server-side pagination, MSP-scoped, indexed for sort/filter on the columns that matter.
+
+#### Custom roles (per-tenant scoping)
+
+- The "custom role" concept introduced in Phase 1 (interface only) is now functional: an MSP can author a custom role with a per-customer-tenant scope ("Editor on tenants A, B, C; Readonly on D"), persisted in `platform_admin.custom_roles`, and the policy evaluator checks both the policy claim and the per-tenant scope.
+
+#### JIT admin elevation
+
+- An MSP Admin can request just-in-time elevation to a higher-privileged GDAP role for a bounded window (default 1 h, max 8 h) with a justification captured into audit.
+- Elevation actually re-issues a Graph token under the elevated GDAP role; expiry of the window auto-revokes.
+
+#### Tenant-level settings
+
+- Per-MSP defaults that apply across all customer tenants (alert recipients, notification channels, refresh windows).
+- Per-customer-tenant overrides where they make sense (refresh window for a specific tenant; standards-applicable list).
+
+### Out of scope
+
+- The Standards engine itself (Phase 6) — Phase 5 ships the grid frames and the slots; the data lands in Phase 6.
+- Endpoint Management / Exchange / Collaboration / Security domains (Phase 7).
+- BPA grid data (Phase 10).
+- PSA integration of onboarding events (Phase 8).
+
+### Entry criteria
+
+- Phase 4 exit criteria all green.
+- A second test customer tenant available so multi-tenant grids actually have ≥ 2 rows.
+- Partner Center sandbox accepting GDAP invites end-to-end.
+
+### Exit criteria
+
+1. Onboarding a fresh customer tenant from scratch via the UI completes in ≤ 10 min wall-clock (most of which is human GDAP-acceptance time, not our processing).
+2. The onboarding saga survives a worker restart mid-flight without losing state; saga row is queryable; resume happens automatically.
+3. All-tenants list page renders in ≤ 800 ms p95 over warm cache for an MSP with 200 customer tenants (synthetic load for verification).
+4. Offboarding a customer tenant completes, projection rows are gone, audit log persists, tenant is `Offboarded` and not visible to default queries (without breaking historical audit reads).
+5. Custom role with per-tenant scope: a user assigned to it cannot view tenants outside the scope (verified by the standard pen-test sweep).
+6. JIT elevation: a user requests, gets the elevated token, performs an action, the action audits with `actor.elevation = jit-{requestId}`, the elevation expires automatically.
+7. GDAP relationship sync runs on schedule and reflects an out-of-band relationship change (manual delete in Partner Center) in ≤ 20 min.
+8. Coverage `>= 80%` on `Application/Tenants/*` and `Domain/Tenants/*`.
+9. The home dashboard ships with the all-tenants grids visible and clickable through to per-tenant detail.
+10. `MEMORY.md` updated.
+
+### Verification
+
+- An end-to-end onboarding demo recorded against a fresh sandbox tenant.
+- A worker-kill chaos test mid-saga, restart, verify resumption.
+- Pen-test sweep extended to custom-role per-tenant scoping.
+- Performance test: 200-tenant grid render with realistic per-tenant payloads.
+
+### Risks
+
+- **Partner Center latency / inconsistency.** Mitigation: saga waits with backoff; surface the wait state explicitly to the user instead of pretending to be in-flight.
+- **Custom-role policy combinatorics.** Mitigation: the policy evaluator is a small explicit decision tree, not an expression engine; tested with a matrix of claim × scope × resource access cases.
+- **JIT elevation as a privilege-escalation path.** Mitigation: every elevation requires a justification, is rate-limited per MSP user, and triggers an immediate audit notification to the MSP's SuperAdmin.
+
+---
