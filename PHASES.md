@@ -986,3 +986,119 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **Pen-test surfaces a structural issue.** Mitigation: structural findings escalate to a phase scope reopen; we do not ship structural risk into GA.
 
 ---
+
+## Phase 12 — GA / launch
+
+**Goal:** Ship. Make the platform available to paying MSPs, with a public price, public docs, public security posture, public status page, and a serious bug-bounty programme. The bar here is **commercial-grade** — explicitly contrasted with CIPP's $50 / swag posture for a tool with delegated admin into every customer's M365.
+
+### Scope
+
+#### Pricing and billing
+
+- Public pricing page: per-MSP base + per-customer-tenant volume tiers + integration add-ons.
+- Stripe (or equivalent) integration for subscription management; metering against `customer_tenants` count and integration usage.
+- Per-MSP invoicing with VAT handling for EU customers.
+- A trial flow (14 or 30 days; no card required for the trial).
+
+#### Public docs
+
+- A documentation site (`docs.{domain}`) covering: getting started, GDAP onboarding, Standards engine, integrations setup, self-host, API reference (auto-generated from the OpenAPI document), troubleshooting playbooks, the deprecation timeline for BPA.
+- A "what's different from CIPP" comparison page (factual, non-pejorative; the rebuild stands on its merits).
+
+#### Status and incident comms
+
+- A public status page (`status.{domain}`) automated from health checks and incident records.
+- Incident comms templates aligned with the audit log; every incident links to a post-mortem within 5 working days.
+
+#### Security posture
+
+- `SECURITY.md` published with: scope, in-scope vulnerability classes, reward range (commercial-grade tiers, not $50), disclosure timeline, safe-harbour language.
+- A bug-bounty programme via HackerOne or equivalent; rewards funded; triage on-call defined.
+- A SOC 2 Type 1 readiness assessment scheduled for 6 months post-GA (Type 2 follows).
+- Customer-facing data-handling page documenting: what we store, where, encryption posture, retention, deletion-on-request, sub-processors list.
+
+#### Onboarding for the first cohort
+
+- A handful of design-partner MSPs (the cohort that's been involved through the build) onboard first in a controlled rollout.
+- Onboarding has a SuperAdmin shadow during the first 7 days for white-glove support.
+- Post-onboarding survey at day 14 informs the public-launch readiness.
+
+#### Operational readiness
+
+- 24/7 on-call rota.
+- Incident response SLOs: P1 acknowledge 15 min, P2 1 h, P3 next business day.
+- A weekly platform-health review.
+- Customer-facing change-log (`changelog.{domain}`) updated per release.
+
+### Out of scope
+
+- Active-active multi-region (post-GA).
+- SOC 2 Type 2 (≥ 12 months post-GA).
+- A mobile app (not on the roadmap).
+- A reseller / channel programme (post-GA).
+
+### Entry criteria
+
+- Phase 11 exit criteria all green.
+- Stripe (or equivalent) account configured for production.
+- Legal review of pricing terms, ToS, DPA, sub-processor list.
+- Brand assets, marketing copy, and the docs site are ready.
+
+### Exit criteria
+
+1. The platform accepts paid sign-ups end-to-end (sign-up → consent → onboard → first usage → first invoice).
+2. Status page is live and reflects real signal.
+3. SECURITY.md and bug-bounty programme are live; first triage runbook is in place.
+4. Design-partner MSPs are live in production with positive day-14 survey results.
+5. Public documentation site is live and complete for every shipping feature.
+6. On-call rota is staffed, paged-tested, and the first weekly platform-health review is on the books.
+7. `MEMORY.md` updated; ADR-0013 records the launch posture.
+
+### Verification
+
+- An end-to-end paid sign-up rehearsal in production.
+- A simulated P1 incident drill exercises status-page update, customer comms, post-mortem timeline.
+- A bug-bounty test report (intentionally low-severity) flows through triage and reward in a documented timeline.
+
+### Risks
+
+- **Pricing fit.** First-month churn signals pricing miscalibration. Mitigation: pricing is reviewable post-launch; the design-partner cohort is the canary.
+- **Compliance demands faster than SOC 2 Type 1 timeline.** Mitigation: the controls in place from day one map to SOC 2 controls; we publish a pre-Type-1 control narrative.
+- **Bug-bounty triage queue.** A noisy week of low-severity reports can drown signal. Mitigation: tiered intake; auto-rejection of out-of-scope reports; weekly triage review.
+
+---
+
+## Cross-cutting tracks (run in parallel with phases)
+
+Some work threads run continuously alongside the phase work rather than sitting in one phase:
+
+- **Documentation.** Every phase updates `docs/` for its surface; a phase isn't done if its docs are missing.
+- **ADRs.** A non-trivial choice gets an ADR. Numbering is chronological.
+- **Security review.** Every phase has a security review checkpoint at exit; the `/security-review` skill is invoked before the phase merges.
+- **Performance budgets.** Every phase touching UI verifies the budget. Drift is investigated, not normalised.
+- **Accessibility.** WCAG 2.2 AA across every shipping page; verified with axe-core in CI.
+- **Internationalisation.** Strings extracted into resources from day one; English first, others enabled by Phase 12.
+- **Telemetry hygiene.** No metric without a dashboard, no log line without an event id, no alert without a runbook.
+
+---
+
+## What we are deliberately not doing
+
+- A custom orchestration runtime (CIPP's Durable Functions). Sagas in Postgres, Hangfire, Service Bus.
+- A 533-file flat function dump. Bounded contexts and endpoint groups.
+- A frontend that hydrates by paginating Graph. The cache is the centre of gravity.
+- A token store in environment variables. DataProtection-encrypted Postgres, period.
+- A "run any cmdlet by name" dispatcher. Typed scheduled-item kinds only.
+- A fork-and-deploy distribution model. SaaS first, container image second.
+- A $50 / swag bug-bounty for a delegated-admin product. Commercial-grade rewards.
+
+These aren't optimisations to be revisited under deadline pressure — they are the reasons a rebuild is worth doing.
+
+---
+
+## Update protocol
+
+This document is **append-only** within a phase: scope can be deferred to a later phase or carved into a 11.x sub-phase, but the previous phase's exit criteria do not move retroactively. If an exit criterion is unmet at the planned cut, the phase doesn't ship; we extend it explicitly with a `MEMORY.md` note.
+
+If the strategy changes (a phase is reordered, a new phase is added, the index is reshaped), it lands as an ADR and a re-published phase index here, with the old index preserved at the bottom of this document under a "Superseded plans" section so the trail is visible.
+
