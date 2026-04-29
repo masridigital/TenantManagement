@@ -111,3 +111,66 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **CI minutes blowout.** Mitigation: Testcontainers reuse + single shared Postgres image cache; budget 8 min per PR end-to-end.
 
 ---
+
+## Phase 1 — Auth and tenancy
+
+**Goal:** A user can sign in to the Blazor app with their MSP's Entra ID, the app resolves their `MspId`, and every endpoint enforces a typed authorization policy. Customer-tenant access is gated by `ICustomerTenantAuthorizationService`. Refresh tokens have a home that is **not** an environment variable.
+
+### Scope
+
+- Multi-tenant Entra app registration (terraform/Bicep + first-time consent flow documented).
+- `Microsoft.Identity.Web` wired into both the API and the Blazor Web App (BFF posture; tokens never reach the browser).
+- OIDC sign-in: cookie auth on the web side, JWT bearer on the API side, OBO exchange for inter-component calls.
+- `MspContextMiddleware` resolving `tid → MspId` via `MspDirectoryLookup` (a Postgres table populated at MSP onboarding).
+- `MspContextAccessor` (scoped DI service) populated once per request; injected into `AppDbContext`, MediatR pipeline, Hangfire job activator.
+- Authorization policies for the four-role model (`Readonly`, `Editor`, `Admin`, `SuperAdmin`) plus per-feature policies (`Identity.User.ReadWrite`, etc.).
+- `ICustomerTenantAuthorizationService.AssertAccessAsync(mspId, customerTenantId, ct)` with the GDAP relationship lookup. **No actual GDAP call yet** — Phase 2 plugs that in. For now, the relationship store is read from a manually-seeded table; the service interface is final.
+- `IRefreshTokenStore` over `IDataProtectionProvider`-encrypted Postgres rows. DataProtection key in Key Vault. `RefreshTokens` table created with the audited access pattern.
+- `MspDirectoryLookup` cache: L2 (Redis) keyed on `tid`, 1 h TTL; backed by Postgres truth.
+- Audit-log table created (`observability.audit_log`) and the auth pipeline writes denial rows with `actor`, `policy`, `reason`, `traceId`. (Full command-audit lands Phase 2; this is just the auth side.)
+- EF Core global query filter on every entity in `MspContextAccessor`-aware tables (zero entities yet — the convention and lint rule are what land).
+- Lint rule (Roslyn analyzer) failing the build on `IgnoreQueryFilters` outside an allow-list.
+- Sign-in / sign-out / consent UI wired into the Blazor shell.
+- Smoke endpoint `GET /api/me` returning the authenticated principal + resolved `MspId` + roles + the assertion-result for a sample customer-tenant id.
+
+### Out of scope
+
+- Any Graph call (Phase 2).
+- The actual GDAP relationship sync from Partner Center (Phase 5).
+- The MSP-onboarding-flow UI (Phase 5; for Phase 1 we seed MSPs via SuperAdmin API or SQL).
+- PIM / JIT activation (Phase 4).
+- Custom roles with per-tenant scoping (Phase 5; the policies for this exist but the data is fixed).
+
+### Entry criteria
+
+- Phase 0 exit criteria all green.
+- Multi-tenant app registration created in our platform Entra tenant.
+- A test MSP tenant with at least two users (one Editor-equivalent, one Admin-equivalent) provisioned.
+
+### Exit criteria
+
+1. A user from the test MSP tenant can sign in to the Blazor app and see `/api/me` resolved with the correct `MspId` and roles.
+2. A user from a non-onboarded tenant is denied at the `MspDirectoryLookup` step and lands on the "tenant not provisioned" page.
+3. `ICustomerTenantAuthorizationService` returns `Granted` for the seeded relationship and `Denied` for everything else; both outcomes audit-log a row.
+4. `IRefreshTokenStore` round-trips a token through encrypt → store → retrieve → decrypt with the production DataProtection chain.
+5. The `IgnoreQueryFilters` lint rule fires on a deliberately bad PR (proven in CI).
+6. All endpoints (currently just `/api/me`, `/health/*`, `/api/_diagnostics/*`) have an explicit `.RequireAuthorization(...)` or are listed in an `AllowAnonymous` allow-list reviewed at PR time.
+7. Refresh-token-in-env-var grep returns zero hits across the repo (CI step).
+8. Cookie posture verified: no Graph token in the browser; auth cookie is `HttpOnly`, `Secure`, `SameSite=Lax`, encrypted server-side.
+9. Coverage `>= 80%` on the new `Identity` (platform side) and `PlatformAdmin` modules touched in this phase.
+10. `MEMORY.md` updated, `FEEDBACK.md` reviewed for any standard changes.
+
+### Verification
+
+- Two recorded sign-in demos: one happy-path, one denied.
+- Penetration smoke: a user from MSP-A receives a token; `/api/me?customerTenantId={mspBSeededTenant}` returns 403 with audit log row.
+- DataProtection rotation rehearsal: rotate the master key in Key Vault, restart, prove existing rows are still decryptable and new rows use the new key.
+- A purposeful PR that adds `IgnoreQueryFilters` outside the allow-list fails CI; reverting it goes green.
+
+### Risks
+
+- **Cookie-vs-bearer confusion** when the Blazor server calls the API. Mitigation: components call MediatR via DI in-process; `/api/...` is for external integrators and the rare WebAssembly island.
+- **DataProtection key handling.** Mitigation: keys live in Key Vault, never on disk; ADR-0002 documents the rotation contract.
+- **OIDC consent UX.** First sign-in for an MSP requires admin consent. Mitigation: a dedicated "first-time setup" page that walks the admin through, with an explicit error path for "user is not a tenant admin."
+
+---
