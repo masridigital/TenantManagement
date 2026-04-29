@@ -829,3 +829,70 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **App-consent risk subjectivity.** The score is a heuristic and can be wrong. Mitigation: the rubric is published; the score is editable by the MSP per app; overrides are versioned.
 
 ---
+
+## Phase 10 — BPA migration
+
+**Goal:** Honour the install base. CIPP's Best Practice Analyzer is one of its most-used surfaces. The rebuild's Standards engine is a strict superset (typed handlers, drift detection, three modes), but BPA-rule-by-name is what existing CIPP users have muscle memory for and what their reports already reference. This phase ships a forward-compatible BPA wrapper around the Standards engine, plus a one-way migration so MSPs can move CIPP BPA results into the new model without losing history.
+
+### Scope
+
+#### BPA compatibility surface
+
+- A `Bpa` bounded context that exposes endpoints and a UI shape compatible with CIPP's BPA pages (so screenshots, Hudu pages, and PSA tickets that link to BPA URLs continue to make sense).
+- Internally, every "BPA rule" maps 1:1 to a Standards handler in **Report-only** mode. There are no separate BPA execution paths.
+- The BPA grid (per-MSP) and BPA detail pages are read-throughs onto the Standards alignment grid with BPA-specific column ordering and naming.
+- "Run BPA" is a Standards run with the BPA template scope.
+- BPA report exports preserve CIPP's column shape so existing PSA workflows that parse them keep working for at least the rebuild's first GA year.
+
+#### BPA template import
+
+- A migration tool reads CIPP BPA templates (JSON exported from CIPP) and:
+  - Maps each BPA rule to a corresponding Standards handler. Rules without a 1:1 map are surfaced as "unmapped — needs manual review" with the proposed candidate handlers.
+  - Preserves naming, severity classification, and any tenant-scope overrides.
+  - Writes the resulting Standards template into `templates.standards_templates` with a `Source = "BPA-Migrated"` tag.
+- Conversion is **dry-run by default**; the MSP reviews the proposed mapping before committing.
+
+#### Historical BPA data import
+
+- A one-shot migration utility reads a CIPP `BpaResults` table export (from Azure Tables) and projects it into `bpa.historical_runs` for visibility and continuity.
+- Historical runs are read-only; new BPA runs go through Standards.
+
+#### Deprecation plan
+
+- The BPA endpoints are documented as a **compatibility surface**, not a maintained product. The deprecation timeline is published in `README.md`: the surface stays for at least 12 months past GA, then enters a 6-month sunset.
+- Standards is the forward direction. Every BPA UI page links to its Standards equivalent.
+
+### Out of scope
+
+- Building net-new BPA-only logic. Anything new lands as a Standards handler.
+- Migrating CIPP's "templates" that aren't BPA — those belong to Phase 6 (Standards) or Phase 7 (per-domain) imports.
+- A two-way sync between BPA and Standards. The flow is one-way: BPA → Standards.
+
+### Entry criteria
+
+- Phase 9 exit criteria all green.
+- A real CIPP BPA template export (with breadth of rule coverage) and a real `BpaResults` Table export from a participating MSP (anonymised) for verification.
+
+### Exit criteria
+
+1. BPA endpoints + UI surface render and produce results indistinguishable from a Standards run with the equivalent template scope.
+2. The migration tool maps ≥ 90% of CIPP's stock BPA rules automatically; the remainder are surfaced clearly for manual review.
+3. Importing a CIPP BPA template into the Standards engine produces a template that, when run, yields the same per-tenant pass/fail outcomes as CIPP's BPA on the same tenants (verified on the participating MSP's data).
+4. Historical BPA results are importable and readable in the rebuild's BPA grid.
+5. Every BPA UI page has a "this is moving to Standards" banner with a link.
+6. Coverage `>= 80%` on `Application/Bpa/*` and the migration tool.
+7. `MEMORY.md` updated; ADR-0011 records the BPA-as-compatibility-surface decision and the deprecation timeline.
+
+### Verification
+
+- Side-by-side comparison: run CIPP BPA + rebuild BPA on the same anonymised tenant; assert per-rule outcomes match.
+- A migration dry-run against the participating MSP's exported template; manual review of the < 10% unmapped surface.
+- The deprecation banner is reviewed for tone (not punitive; informative).
+
+### Risks
+
+- **Mapping accuracy.** A wrong BPA → Standards mapping silently changes outcomes. Mitigation: dry-run is mandatory; a "compare last CIPP BPA outcome to first rebuild BPA outcome" report runs as part of the migration handoff.
+- **Hudu / PSA URL stability.** External pages link to BPA URLs. Mitigation: URL shape is preserved; deprecation is announced 12 months ahead.
+- **Sunset hostility.** MSPs feel forced to migrate. Mitigation: Standards is genuinely better, and the migration tool does most of the work; the deprecation period is generous.
+
+---
