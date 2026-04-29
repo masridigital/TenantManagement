@@ -734,3 +734,124 @@ CIPP fan-out is bounded only by the Function host's auto-scaling, which means a 
 - ❌ "We retry forever." DLQ exists for a reason; persistent failures escalate.
 
 ---
+
+## 9. Persistence model
+
+PostgreSQL is the **only** relational store. Blob is for archives. Redis is for cache / rate-limit / SignalR backplane / Hangfire. Service Bus for fan-out. **No Azure Tables, no Cosmos, no per-feature DB sprawl** — that pattern is one of CIPP's main scalability ceilings (the 64 KB row limit on Tables is documented as breaking templates since 2023).
+
+### Why Postgres specifically
+
+- Mature `jsonb` for the small set of legitimately schemaless data (Standards settings, template payloads). `jsonb` indexes via GIN.
+- Partial indexes (e.g., `WHERE is_deleted = false AND msp_id = ...`) for projection hot paths.
+- Logical replication for read replicas / blue-green data migrations.
+- Row-level security as a possible second-line defense (we don't rely on it primarily — see §5 — but it's there).
+- `pg_partman` for time-partitioning of the audit log and activity feed.
+
+### Schema layout
+
+One database, multiple schemas. Each bounded context owns its schema; cross-context FKs are forbidden.
+
+```
+identity.users_projection
+identity.groups_projection
+identity.devices_projection
+endpoint_management.managed_devices_projection
+endpoint_management.intune_policies_projection
+exchange_online.mailboxes_projection
+collaboration.sites_projection
+security.alerts_projection
+tenants.customer_tenants
+tenants.gdap_relationships
+standards.standard_runs
+standards.drift_baselines
+templates.ca_templates
+templates.intune_templates
+reports.license_usage_history
+automation.scheduled_jobs
+automation.scheduled_job_runs
+automation.integration_credentials
+platform_admin.msps
+platform_admin.msp_users
+platform_admin.msp_roles
+platform_admin.refresh_tokens
+observability.audit_log
+observability.activity_feed
+graph.delta_cursors
+graph.command_idempotency
+graph.message_outbox
+graph.sagas
+```
+
+EF Core composes this single database from per-context `DbContext` partials — there is one physical `AppDbContext` at runtime, but its `OnModelCreating` is split per context so contexts evolve independently.
+
+### Mandatory columns on every multi-tenant table
+
+```
+MspId           UUID NOT NULL                               -- platform tenancy
+CreatedAtUtc    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CreatedById     UUID NOT NULL                               -- MspUserId or system principal
+UpdatedAtUtc    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+UpdatedById     UUID NOT NULL
+RowVersion      BYTEA NOT NULL                              -- xmin-based concurrency token
+IsDeleted       BOOLEAN NOT NULL DEFAULT FALSE              -- soft-delete + global query filter
+```
+
+These are enforced by an EF Core `IModelConvention` that fails the build if a multi-tenant entity is missing any of them.
+
+### Typed columns vs. jsonb — the rule
+
+Default to typed columns. Use `jsonb` only when **the shape is genuinely free-form** and the queries against it are prefix-matched / containment-matched — not for every Graph response we happen to want to cache.
+
+| Right use of jsonb | Wrong use of jsonb |
+| ------------------ | ------------------ |
+| Standards settings (different shape per standard) | Cached user object (typed columns + GIN on `extension_attributes`) |
+| Template payloads (CA, Intune, transport rule — opaque to us until applied) | Audit log payload — typed columns for `actor`, `command`, `target`, `outcome`, `status` |
+| PSA integration provider-specific config | License SKU list (typed) |
+| Drift diffs as JSON Patch | Group memberships (typed join table) |
+
+### Indexing strategy
+
+- Every multi-tenant table has a composite index on `(MspId, CustomerTenantId, ...)` for the most common projection lookups.
+- Lists that drive grids have **covering indexes** including the columns the UI sorts on.
+- `(MspId, IsDeleted)` partial indexes on hot tables avoid scanning soft-deleted rows.
+- `GIN` on jsonb columns where containment queries are real (e.g., `template_payload @> '{"type": "ca"}'`).
+- Time-series tables (`audit_log`, `activity_feed`, `standard_runs`) are **time-partitioned** monthly; old partitions are detached and archived to Blob after 90 days.
+
+### Soft-delete vs. hard-delete
+
+- Default: **soft-delete** via `IsDeleted = TRUE` + global query filter. Reversible, audit-friendly.
+- **Hard-delete** is allowed only for ephemeral records (job runs, idempotency keys, message outbox) older than 90 days, performed by a `pg_partman`-driven retention job.
+- Compliance-driven hard-deletes (e.g., GDPR right-to-erasure on an MSP user record) go through `IPlatformAdminService.HardDeleteAsync`, which:
+  1. Asserts SuperAdmin + an active deletion ticket id.
+  2. Writes an audit row recording the ticket.
+  3. Hard-deletes the record and any rows referencing it via cascade.
+
+### Migrations
+
+- EF Core migrations checked into source control under `Infrastructure/Persistence/Migrations`.
+- Migrations **never run on app startup** in any non-dev environment. CIPP's pattern of running schema changes when the Function App boots is a recipe for half-migrated state under load.
+- Migrations are a CI step against a target environment **before** the app rollout; rollout fails fast if migrations failed.
+- Backward-compatible migrations only: add column nullable → backfill → mark NOT NULL in next deploy. No "stop the world" schema breaks.
+- Migration tests run against a fresh Postgres + the previous-deploy snapshot to catch shape regressions.
+
+### Concurrency control
+
+- `RowVersion` (`xmin`) on every row for optimistic concurrency.
+- Update commands check `RowVersion` and fail with `409 Conflict` if it changed; the UI re-fetches and shows a 3-way diff.
+- Long-running edits (e.g., a multi-step CA policy editor) use **draft rows** in a separate `<table>_drafts` schema, materialized into the canonical row only on save.
+
+### Read replicas and blue-green
+
+- Production runs **one** primary + **one** read replica (initial scale; expand later).
+- Read replica handles long-running report queries (`Reports` context) so OLTP is not perturbed.
+- Blue-green data migrations use logical replication: new schema on the green side, dual-write during cutover, old side decommissioned after a soak period.
+
+### Anti-rules
+
+- ❌ Storing the JSON blob from Graph and re-parsing it on every read. Project to typed columns.
+- ❌ Cross-context FKs. Use a `MspId + EntityId` "weak reference" in the dependent context, validated at the application layer.
+- ❌ Auto-migration on app startup outside dev.
+- ❌ Schema changes that aren't backward-compatible within a single deploy.
+- ❌ One row per "every K-V config item" anti-pattern (e.g., a `Settings` table with `key, value` columns). Use a typed config row per concept.
+
+---
