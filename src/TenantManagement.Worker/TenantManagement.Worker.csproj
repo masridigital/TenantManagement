@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-TenantManagement.Worker-45afdbe6-7bcf-40b3-9bf3-4d5f73424187</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Hangfire.AspNetCore" Version="1.8.23" />
+    <PackageReference Include="Hangfire.MemoryStorage" Version="1.8.1.2" />
+    <PackageReference Include="Hangfire.Redis.StackExchange" Version="1.12.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.7" />
+    <PackageReference Include="StackExchange.Redis" Version="2.12.14" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TenantManagement.Application\TenantManagement.Application.csproj" />
+    <ProjectReference Include="..\TenantManagement.Infrastructure\TenantManagement.Infrastructure.csproj" />
+    <ProjectReference Include="..\TenantManagement.Graph\TenantManagement.Graph.csproj" />
+    <ProjectReference Include="..\TenantManagement.Standards\TenantManagement.Standards.csproj" />
+  </ItemGroup>
+</Project>

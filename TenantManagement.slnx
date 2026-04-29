@@ -1,0 +1,18 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/TenantManagement.Api/TenantManagement.Api.csproj" />
+    <Project Path="src/TenantManagement.Application/TenantManagement.Application.csproj" />
+    <Project Path="src/TenantManagement.Domain/TenantManagement.Domain.csproj" />
+    <Project Path="src/TenantManagement.Graph/TenantManagement.Graph.csproj" />
+    <Project Path="src/TenantManagement.Infrastructure/TenantManagement.Infrastructure.csproj" />
+    <Project Path="src/TenantManagement.Migrations/TenantManagement.Migrations.csproj" />
+    <Project Path="src/TenantManagement.Standards/TenantManagement.Standards.csproj" />
+    <Project Path="src/TenantManagement.Web/TenantManagement.Web.csproj" />
+    <Project Path="src/TenantManagement.Worker/TenantManagement.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/TenantManagement.E2E/TenantManagement.E2E.csproj" />
+    <Project Path="tests/TenantManagement.IntegrationTests/TenantManagement.IntegrationTests.csproj" />
+    <Project Path="tests/TenantManagement.UnitTests/TenantManagement.UnitTests.csproj" />
+  </Folder>
+</Solution>

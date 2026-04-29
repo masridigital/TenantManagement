@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "Dlv+57PEo3E=",
+  "success": true,
+  "projectFilePath": "/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Web/TenantManagement.Web.csproj",
+  "expectedPackageFiles": [
+    "/Users/josephmasri/.nuget/packages/microsoft.aspnetcore.app.internal.assets/10.0.7/microsoft.aspnetcore.app.internal.assets.10.0.7.nupkg.sha512"
+  ],
+  "logs": []
+}

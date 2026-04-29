@@ -1,0 +1,16 @@
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/obj/Debug/net10.0/TenantManagement.Application.csproj.AssemblyReference.cache
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/obj/Debug/net10.0/TenantManagement.Application.GeneratedMSBuildEditorConfig.editorconfig
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/obj/Debug/net10.0/TenantManagement.Application.AssemblyInfoInputs.cache
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/obj/Debug/net10.0/TenantManagement.Application.AssemblyInfo.cs
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/obj/Debug/net10.0/TenantManagement.Application.csproj.CoreCompileInputs.cache
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/obj/Debug/net10.0/TenantManagement.Application.sourcelink.json
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/bin/Debug/net10.0/TenantManagement.Application.deps.json
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/bin/Debug/net10.0/TenantManagement.Application.dll
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/bin/Debug/net10.0/TenantManagement.Application.pdb
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/bin/Debug/net10.0/TenantManagement.Domain.dll
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/bin/Debug/net10.0/TenantManagement.Domain.pdb
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/obj/Debug/net10.0/TenantMa.9C627478.Up2Date
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/obj/Debug/net10.0/TenantManagement.Application.dll
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/obj/Debug/net10.0/refint/TenantManagement.Application.dll
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/obj/Debug/net10.0/TenantManagement.Application.pdb
+/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Application/obj/Debug/net10.0/ref/TenantManagement.Application.dll

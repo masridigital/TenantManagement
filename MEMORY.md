@@ -8,14 +8,118 @@
 
 ## Active state
 
-- **Phase:** Pre-Phase 0 (Planning)
+- **Phase:** Phase 2 (Identity & Access Domain)
 - **Branch:** `claude/analyze-cipp-repos-UzlQB`
-- **Current goal:** Land the seven planning documents (README, CLAUDE, ARCHITECTURE, PHASES, MEMORY, FEEDBACK, REBUILD_PLAN) so Phase 0 can begin from a complete brief.
-- **Next concrete task:** Author `ARCHITECTURE.md`, then `PHASES.md`, then `REBUILD_PLAN.md`.
+- **Current goal:** Execute End-to-End cache and Graph sync mechanisms locally.
+- **Next concrete task:** Start the Worker and Api locally using `dotnet run` (Docker dependency removed) to verify functionality.
 
 ---
 
 ## Session log
+
+### 2026-04-29 — Entities, Context Accessor, and EF Migrations Setup
+
+**Goal:** Implement the multi-MSP isolation logic and test Entity Framework migrations.
+
+**Done this session:**
+- Implemented `MspContextAccessor` in `TenantManagement.Api` and wired it into `Program.cs`. This extracts the `MspId` from user claims.
+- Created `BaseEntity` abstract class in `TenantManagement.Domain` that strictly enforces `MspId`, `CreatedAtUtc`, `IsDeleted`, and `RowVersion` properties on all entities.
+- Created `CustomerTenant` entity as a baseline testing structure.
+- Updated `ApplicationDbContext` to iterate through all entities inheriting from `BaseEntity` via reflection, injecting an EF Core Global Query Filter that guarantees `e => e.MspId == _mspContextAccessor.MspId && !e.IsDeleted`.
+- Successfully generated the first EF Core Migration (`InitialCreate`) showing the complete application of our schema structure and inherited `MspId` isolation.
+
+**Decisions logged this session:**
+- Applied the global query filter programmatically in `OnModelCreating` to prevent developers from accidentally forgetting to add it per configuration.
+- CIPP feature parity requires robust data isolation natively at the query level, which has now been established.
+
+**Blocked / open questions:**
+- Docker daemon was not running during execution, so the migration has not been applied to a live database yet.
+
+**Next session should:**
+1. Start Docker to bring up Postgres, Redis, and Azurite containers.
+2. Apply the `InitialCreate` and `AddTenantUsers` migrations.
+3. Test the Background workers (`CustomerTenantSyncJob` and `TenantUserSyncJob`) via the Hangfire dashboard.
+4. Continue scaffolding Phase 2 entities (Devices, GDAP mappings, App Registrations) following the exact same pattern.
+
+**Files touched this session:**
+- `TenantManagement.Domain/Entities/TenantUser.cs`
+- `TenantManagement.Domain/Entities/TenantGroup.cs`
+- `TenantManagement.Application/Common/Interfaces/IApplicationDbContext.cs`
+- `TenantManagement.Infrastructure/Persistence/ApplicationDbContext.cs`
+- `TenantManagement.Infrastructure/Persistence/Migrations/*` (AddTenantUsers)
+- `TenantManagement.Worker/Jobs/TenantUserSyncJob.cs`
+- `TenantManagement.Worker/Program.cs`
+- `TenantManagement.Application/Users/Queries/GetTenantUsers/*`
+- `TenantManagement.Api/Endpoints/UsersEndpoints.cs`
+- `TenantManagement.Api/Program.cs`
+- `MEMORY.md` (updated)
+
+### 2026-04-29 — Base API, Database, and Background Jobs Scaffolding
+
+**Goal:** Configure the foundational services inside the ASP.NET Core API and Background Worker projects.
+
+**Done this session:**
+- Installed `Microsoft.Identity.Web` and configured JWT Authentication and base Authorization policies in `TenantManagement.Api`.
+- Removed the default weather forecast code from `Program.cs` and replaced it with a structured Minimal APIs configuration (mapped `/api/health`).
+- Set up `ApplicationDbContext` in `TenantManagement.Infrastructure` using `Npgsql` for PostgreSQL, including an interface `IApplicationDbContext` for the Application layer to consume.
+- Scaffolded `IMspContextAccessor` in the Application layer to prepare for multi-MSP global query filters.
+- Installed `Hangfire` and `StackExchange.Redis` in `TenantManagement.Worker`, and configured it to use Redis as its storage provider.
+- Created extension methods `AddApplicationServices` and `AddInfrastructureServices` for clean dependency injection, registering MediatR, FluentValidation, and EF Core.
+
+**Decisions logged this session:**
+- Used `Hangfire.Redis.StackExchange` for Hangfire storage as defined by the architecture.
+- Scaffolded an empty `IMspContextAccessor` which will need to be populated from claims middleware.
+
+**Blocked / open questions:**
+- None.
+
+**Next session should:**
+1. Implement the `MspContextAccessor` middleware to extract the `MspId` from the authenticated principal.
+2. Create a base `Entity` abstract class in the Domain layer that includes `MspId`, `CreatedAtUtc`, and `RowVersion` properties.
+3. Configure the EF Core Global Query Filter for `MspId` in `ApplicationDbContext`.
+4. Run the first EF Core Migration and verify it against the local Postgres container.
+
+**Files touched this session:**
+- `TenantManagement.Api/Program.cs`
+- `TenantManagement.Api/appsettings.json`
+- `TenantManagement.Worker/Program.cs`
+- `TenantManagement.Worker/appsettings.json`
+- `TenantManagement.Infrastructure/Persistence/ApplicationDbContext.cs`
+- `TenantManagement.Infrastructure/DependencyInjection.cs`
+- `TenantManagement.Application/DependencyInjection.cs`
+- `TenantManagement.Application/Common/Interfaces/IApplicationDbContext.cs`
+- `TenantManagement.Application/Common/Interfaces/IMspContextAccessor.cs`
+- `MEMORY.md` (updated)
+
+### 2026-04-29 — Completion of Planning Documents
+
+**Goal:** Author the remaining planning documents to complete the Pre-Phase 0 goals.
+
+**Done this session:**
+- Read and internalized `FEEDBACK.md` directives (Graph wrapper rule, cache hierarchy, auth simplicity).
+- Authored `ARCHITECTURE.md` defining the caching architecture, read/write paths, bounded-context map, and multi-MSP isolation model.
+- Authored `PHASES.md` defining the 12 phases of the project implementation.
+- Authored `REBUILD_PLAN.md` acting as the master strategic document containing audit findings, the rebuild thesis, and timeline.
+- Updated `MEMORY.md` to transition the project state to Phase 0.
+
+**Decisions logged this session:**
+- Project officially transitions from Pre-Phase 0 (Planning) to Phase 0 (Foundation). All foundational planning documents are securely in place.
+
+**Blocked / open questions:**
+- None. Ready for implementation.
+
+**Next session should:**
+1. Configure the base API scaffolding with ASP.NET Core 10 Minimal APIs and `Microsoft.Identity.Web` in `TenantManagement.Api`.
+2. Configure basic Entity Framework Core DbContext in `TenantManagement.Infrastructure`.
+3. Set up Redis and Hangfire in the Worker project.
+
+**Files touched this session:**
+- `ARCHITECTURE.md` (created)
+- `PHASES.md` (created)
+- `REBUILD_PLAN.md` (created)
+- `MEMORY.md` (updated)
+- `docker-compose.yml` (created)
+- `TenantManagement.sln` and all related `.csproj` project files (created)
 
 ### 2026-04-29 — Initial planning workspace
 

@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  # Primary relational database
+  postgres:
+    image: postgres:17-alpine
+    container_name: tm-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-tenantmanagement}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Distributed cache, rate limit state, and SignalR backplane
+  redis:
+    image: redis:7-alpine
+    container_name: tm-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Azure Blob Storage Emulator for baseline diffs and audit archives
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: tm-azurite
+    ports:
+      - "10000:10000" # Blob
+      - "10001:10001" # Queue
+      - "10002:10002" # Table
+    volumes:
+      - azurite_data:/data
+    command: "azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0 --location /data"
+
+volumes:
+  postgres_data:
+  redis_data:
+  azurite_data:
