@@ -389,3 +389,135 @@ A small set of operations legitimately span MSPs (billing rollups, fleet health,
 - Cannot read operational secrets — those are sealed even from SuperAdmin via Key Vault access policy and require a separate, ticketed break-glass flow.
 
 ---
+
+## 6. Graph integration
+
+The first instinct on a CIPP rebuild is to replicate the PowerShell helpers in C#. **Do not do this.** The PowerShell helpers exist because the PowerShell ecosystem lacked typed Graph clients in 2021. .NET has had them since `Microsoft.Graph` v3 and they have only improved. Concretely, the rebuild leans on the SDK for everything the SDK already does, and only writes code where the SDK leaves a gap.
+
+### What `Microsoft.Graph` SDK v5 already gives us
+
+- Typed entity models for every Graph resource (`User`, `Group`, `Device`, `ConditionalAccessPolicy`, `ManagedDevice`, ...).
+- `PageIterator<T>` — pagination + throttling + `Retry-After` honouring + cancellation. Replaces 100% of CIPP-API's `nextLink` chasing.
+- `BatchRequestContent` — JSON `$batch` with per-subresponse status inspection. Replaces the PowerShell helper that silently lost inner 429s.
+- `Delta()` extensions on `users`, `groups`, `directoryObjects`, `devices`, `messages`, with `deltaLink` extraction.
+- Native cancellation token plumbing through the Kiota request pipeline.
+- A `IRequestAdapter` we can replace or wrap to add custom telemetry, audit, and resilience policies.
+
+### What `Microsoft.Identity.Web` already gives us
+
+- OBO (`AcquireTokenOnBehalfOfAsync`), refresh, certificate auth, MSI, confidential client.
+- Distributed token cache via `MicrosoftIdentityWebChallengeUserException`-aware middleware.
+- App-only token acquisition with `client_credentials` flow for background workers.
+- Multi-tenant sign-in with home-tenant `tid` claim resolution.
+
+The CIPP "SAM ceremony" — refresh tokens mirrored into env vars, the `CIPP.CIPPTokenCache` shim compiled into `CIPPSharp.dll`, the per-tenant token plumbing — collapses to: `IConfidentialClientApplication` + `ITokenAcquisition` + a thin `IRefreshTokenStore` over `IDataProtectionProvider`-protected Postgres rows.
+
+### `IGraphTenantClient` — what we *do* write
+
+The one thin abstraction we own:
+
+```csharp
+public interface IGraphTenantClient
+{
+    GraphServiceClient Client { get; }                // typed SDK surface
+    string TenantId { get; }
+    Guid MspId { get; }
+    Task<HttpResponseMessage> SendBatchAsync(
+        BatchRequestContent batch, CancellationToken ct);
+}
+```
+
+It exists to:
+
+1. **Carry tenant identity** so every call is tagged with `(MspId, CustomerTenantId)` for telemetry without the caller passing them again.
+2. **Wrap the request adapter** in a Polly v8 pipeline (see below).
+3. **Force batch subresponse inspection** — `SendBatchAsync` returns success **only if every subresponse was 2xx**. A 200 outer response containing 429 inner responses is a failure.
+4. **Audit** — every Graph call is recorded with endpoint, status, retry count, latency.
+
+It does **not** wrap individual Graph operations (`AddUserAsync`, `GetUsersAsync`, etc.). Application code calls `_client.Client.Users.PostAsync(...)` — straight SDK. The factory is the abstraction; the operations are not.
+
+### The Polly v8 pipeline
+
+Built once in `Program.cs`, applied to the SDK's `HttpClient` via a `DelegatingHandler`:
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│ Outer:   Bulkhead per MSP (concurrency cap N=64 in-flight)         │
+│ │                                                                  │
+│ ├─ Inner: Per-customer-tenant rate limiter (token bucket; Redis)   │
+│ │                                                                  │
+│ ├─ Inner: Retry on 429 honoring Retry-After (cap 60s, max 5)       │
+│ │                                                                  │
+│ ├─ Inner: Retry on transient 5xx with jittered exponential backoff │
+│ │                                                                  │
+│ ├─ Inner: Timeout per attempt (30s default)                        │
+│ │                                                                  │
+│ └─ Inner: Circuit breaker per (msp, customerTenant)                │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+- **Bulkhead per MSP** stops a noisy MSP from starving others' Graph quota.
+- **Per-customer-tenant rate limiter** stops a single MSP's fan-out (Standards run across 100 tenants) from tripping Graph's per-tenant quota.
+- **`Retry-After` honouring** is non-negotiable — Microsoft documents this; ignoring it is how you get 429-banned.
+- **Circuit breaker per `(msp, customerTenant)`** stops flooding a tenant whose Graph endpoint is failing systemically (e.g., directory replication issue) and surfacing the failure to the UI fast.
+
+### Pagination — the rule
+
+The application never writes:
+
+```csharp
+var users = new List<User>();
+var page = await _client.Client.Users.GetAsync(...);
+while (page.OdataNextLink != null) { /* ... */ }
+```
+
+The application writes:
+
+```csharp
+var page = await _client.Client.Users.GetAsync(rb => { rb.QueryParameters.Top = 999; });
+var iterator = PageIterator<User, UserCollectionResponse>
+    .CreatePageIterator(_client.Client, page, async user => { /* project */ return true; });
+await iterator.IterateAsync(ct);
+```
+
+— and only ever inside a **background warmer**, never on a request thread (see §3).
+
+### Batching — the rule
+
+Bulk writes (multi-user create, multi-policy assign, etc.) build a `BatchRequestContent` of up to 20 sub-requests, dispatch via `_client.SendBatchAsync(batch, ct)`, and inspect the `BatchResponseContent` for **every** sub-response status. Inner 429s honour the inner `Retry-After`; the un-acked sub-requests are repacked into a follow-up batch. CIPP's PowerShell batch helper does not do this — that bug is the source of the "BPA ran but half my tenants didn't get touched" reports.
+
+### Delta queries — the rule
+
+Every list resource that supports `delta` is synced via `delta` on every refresh except the first. The `deltaLink` cursor is persisted in `GraphDeltaCursors`:
+
+```sql
+CREATE TABLE GraphDeltaCursors (
+    MspId UUID NOT NULL,
+    CustomerTenantId UUID NOT NULL,
+    ResourceType TEXT NOT NULL,        -- 'users', 'groups', 'devices', ...
+    DeltaLink TEXT NOT NULL,
+    LastSyncedAt TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (MspId, CustomerTenantId, ResourceType)
+);
+```
+
+A failed delta cursor (token expired, resync required) drops back to a full sync **and** emits a metric. If the delta-failure rate exceeds 5% across the fleet, alarms fire — that's a signal of a regression in either Graph or our cursor handling, not a routine.
+
+### Where the SDK leaves a gap
+
+A small set of M365 surfaces (Exchange Online cmdlets, Teams CAP edge cases, some legacy Skype-for-Business voice settings) still require PowerShell or REST calls outside the typed SDK. These are isolated in:
+
+- `TenantManagement.Graph.ExchangeShim` — runs inside our process via `System.Management.Automation` against an in-process runspace pool (one per `(MspId, CustomerTenantId)`), strictly bounded with timeouts.
+- `TenantManagement.Graph.LegacyRest` — direct `HttpClient` calls to specific endpoints we explicitly enumerate.
+
+Both go through the same Polly pipeline and same audit hooks as the typed SDK. The rest of the app does not know they exist.
+
+### Anti-rules
+
+- ❌ **Do not hand-roll OAuth.** `Microsoft.Identity.Web` does it. If a feature seems to need a custom flow, the SDK probably does it under a different method name.
+- ❌ **Do not hand-roll Graph batch handling.** Use `BatchRequestContent` and inspect every subresponse.
+- ❌ **Do not hand-roll pagination.** Use `PageIterator<T>`. If the SDK's pager doesn't fit, file a bug at `microsoft/msgraph-sdk-dotnet`, do not vendor a copy.
+- ❌ **Do not hand-roll delta.** Use the SDK's `Delta()` extensions; persist `deltaLink`; replay.
+- ❌ **Do not write a "graph_request" generic forwarder** ([CIPP-API has one](https://github.com/KelvinTegelaar/CIPP-API/blob/master/Modules/CIPPCore/Public/GraphHelper)). It is unsafe (any caller can dispatch any URL) and pointless (the SDK already does this typed).
+
+---
