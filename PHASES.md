@@ -308,3 +308,94 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **Hot-key Redis pressure.** A few very large MSPs can put 80% of read traffic on a few keys. Mitigation: L1 absorbs the hot read; L2 keys carry compressed payloads; the per-MSP bulkhead caps ingest.
 
 ---
+
+## Phase 4 — Identity domain (first end-to-end UI)
+
+**Goal:** First real user-facing surface. An MSP user signs in, picks a customer tenant, sees a server-paginated grid of users with sub-second renders from cache, and can do CRUD + bulk operations that round-trip Graph through the full write path with audit, projection update, and SignalR push. By the end of this phase, the app is a credible drop-in for CIPP's user management — but faster, typed, and correctly multi-tenant.
+
+### Scope
+
+#### Read surface
+
+- Users grid with server-side pagination, filtering, sorting, column selection, persisted view per MSP user.
+- User detail page: profile, manager, group memberships, license assignments, sign-in logs (lazy-loaded), risky-user state.
+- Groups grid + detail (members, owners, dynamic membership rule view).
+- Devices (Entra-registered) grid + detail.
+- Sign-in logs query page: filter by date / user / status / IP / location; results streamed via cursor pagination from Graph (this is one of the few **on-demand** queries that doesn't go through L3 — sign-in logs are queryable, not projected).
+- Risky users grid + detail; "Dismiss" command.
+- Breach search (HIBP integration) — two surfaces: per-account check, per-tenant scan with results table.
+- All grids respect the four-role policy model from Phase 1 (`Identity.User.Read`, `Identity.User.ReadWrite`, etc.).
+- All grids show the "data refreshed N minutes ago" footer with a "refresh now" affordance that enqueues a warmer kick (rate-limited per-tenant per-resource to once per 30 s).
+
+#### Projections (additions to Phase 3's pattern)
+
+- `identity.groups_projection` + `identity.group_members_projection` (typed join table) + delta cursor.
+- `identity.devices_projection` + delta cursor.
+- All driven by the same warmer / resolver pattern; no new infrastructure.
+
+#### Write surface
+
+- Create user (single + bulk CSV).
+- Edit user (typed field set, with FluentValidation; multi-step UI but single transaction).
+- Disable / enable user, reset password, revoke sessions.
+- Edit aliases.
+- Set user photo.
+- Per-user MFA reset / set auth method.
+- Add to / remove from group; bulk membership change with batch + SignalR progress.
+- Assign / unassign licenses (single + bulk).
+- Hide from GAL.
+- Restore deleted user.
+- Dismiss risky user.
+- Create temporary access pass (TAP).
+- Every write goes through the five-step write path from `ARCHITECTURE.md` §4 (authorize → write-ahead audit → Graph → projection update + audit ack in same txn → invalidate + SignalR notify).
+
+#### UI infrastructure
+
+- Blazor Web App shell: top-bar tenant picker (with type-ahead, recent tenants), left-nav by domain, breadcrumbs.
+- MudBlazor table component wrapper with the standard "skeleton on first paint + data on warm" pattern.
+- SignalR client wired into the shell; toast + grid-row updates for write events.
+- A `/customer-tenant/{id}/identity/...` URL scheme that survives refresh and is shareable within an MSP.
+- An "in-flight operations" tray showing bulk progress.
+
+### Out of scope
+
+- App registrations / SPN management (Phase 5 — those are tenant-administration concepts more than identity).
+- GDAP role mapping UI (Phase 5).
+- Just-in-time admin elevation (Phase 5).
+- Custom-role authoring with per-tenant scopes (Phase 5).
+- Conditional Access policies (Phase 7 under Security).
+- Intune-managed devices (Phase 7).
+
+### Entry criteria
+
+- Phase 3 exit criteria all green.
+- The test customer tenant has a representative user / group / device fleet (≥ 500 users, ≥ 50 groups, ≥ 200 devices) so grids and bulks are realistic.
+- Design tokens and the MudBlazor theme finalised so this phase doesn't bleed into per-page styling churn.
+
+### Exit criteria
+
+1. An MSP Editor signs in, navigates to the test customer tenant, sees the users grid render in ≤ 500 ms p95 over warm cache, paginates / filters / sorts without re-rendering the grid frame.
+2. Creating a user succeeds end-to-end: Graph call observed, audit row written, projection row appears, SignalR pushes the new row to the open grid, and the grid updates without a page refresh.
+3. Bulk-add 200 users via CSV: batches of 20, audit row per bulk, per-row outcome streamed via SignalR, partial failures surfaced inline, no Graph throttle errors leak past the Polly pipeline.
+4. Disable user → projection updated → grid badge updates live.
+5. Sign-in logs page returns 50 results in ≤ 1.5 s p95 (this is the on-demand path, not L3).
+6. A user from MSP-A cannot URL-tamper to view MSP-B's grid (verified by pen-test sweep of the Identity routes).
+7. Coverage `>= 80%` on `Application/Identity/*` and `Domain/Identity/*`.
+8. bUnit tests cover every grid component's render-from-loading and render-from-data paths.
+9. Playwright smoke tests cover: sign-in → list users → edit user → bulk add → bulk license assign → revoke sessions.
+10. Performance budgets met across the Identity surface: p95 page render ≤ 500 ms (warm), p99 ≤ 1.5 s.
+11. `MEMORY.md` updated.
+
+### Verification
+
+- A 30-minute "shadow CIPP" demo where the same MSP-day workflow is performed in CIPP and in the rebuild, side-by-side, with timings.
+- A pen-test sweep of all identity routes against horizontal access (MSP-A → MSP-B) and vertical access (Readonly → Editor commands).
+- Nightly Playwright run against `staging` with traces uploaded.
+
+### Risks
+
+- **Bulk operations are the highest blast-radius surface.** Mitigation: bulk-add and bulk-license assign require explicit confirm + ticket-id-or-justification field captured into audit.
+- **CSV ingestion shape variability.** Mitigation: schema validation up front; preview UI shows what will happen before submit.
+- **Sign-in log queries against tenants with very high signal volume time out.** Mitigation: query is bounded by date range with sane defaults; cursor-based; surface the cursor in the URL so users can resume.
+
+---
