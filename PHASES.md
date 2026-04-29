@@ -588,3 +588,81 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **Drift noise.** Microsoft pushes settings shapes around (new properties, defaults change). Mitigation: a per-property "ignore if unset" flag in the standard's metadata; baselines store both the recorded shape and the schema version.
 
 ---
+
+## Phase 7 — Endpoint Management + Exchange Online + Collaboration + Security
+
+**Goal:** Bring the four large customer-tenant domains to feature parity with CIPP. This is the longest phase by raw line count but the lowest architectural risk: every domain is the same pattern (resolver + projection + warmer + write handlers) with domain-specific Graph calls and standards. Splitting these four into separate sub-phases is reasonable; sequencing them inside one phase keeps the cross-domain features (e.g., per-tenant compliance dashboard) coherent.
+
+### Scope
+
+#### EndpointManagement (Intune)
+
+- Projections: `endpoint_management.managed_devices`, `endpoint_management.intune_policies`, `endpoint_management.applications`, `endpoint_management.assignment_filters`, `endpoint_management.compliance_policies`. Delta-driven where supported; full-refresh-on-schedule otherwise.
+- Read surface: managed devices grid, device detail, policies grid, applications grid, assignment filters grid, compliance policies grid, autopilot enrolment view.
+- Write surface: deploy / edit / delete policies, deploy / remove apps (Office, Win32, store, Choco repository), assign / unassign apps and policies, autopilot config CRUD, autopilot device CRUD, intune script CRUD, reusable settings CRUD, compliance policy CRUD, defender deployment.
+- Sensitivity-flagged operations: BitLocker recovery key read, LAPS local admin password read. Both require step-up auth (re-MFA) at the action moment, JIT-allowable, audited as `category = "secret-recovery"`, surfaced in a separate audit lane.
+- Standards specific to this domain: device compliance baseline, autopilot baseline, BitLocker / LAPS posture, etc. (≥ 25 standards).
+
+#### ExchangeOnline
+
+- Projections: `exchange_online.mailboxes`, `exchange_online.transport_rules`, `exchange_online.connectors`, `exchange_online.anti_spam_filters`, `exchange_online.anti_phishing_filters`, `exchange_online.malware_filters`, `exchange_online.safe_links`, `exchange_online.safe_attachments`, `exchange_online.quarantine_policies`. Mailbox metadata only; **no message bodies stored**.
+- Read surface: mailboxes grid, mailbox detail (CAS, mobile devices, permissions, rules, OOO, calendar permissions, contact permissions), transport rules grid, connectors grid, the four filter grids, safe-links / safe-attachments grids, quarantine, message trace, mailbox restore tracker.
+- Write surface: mailbox conversion (regular ↔ shared ↔ room ↔ equipment), permissions edit, rules edit, OOO edit, transport rule add / edit / remove, connector add / edit / remove, filter policies add / edit / remove, safe-links / safe-attachments add / edit / remove, quarantine policy add / edit / remove, mailbox restore initiate, retention hold / litigation hold set, archive enable, auto-expanding archive enable, calendar processing set, mailbox quota / locale / email-size set.
+- The Exchange shim (`TenantManagement.Graph.ExchangeShim`) hosts the in-process PowerShell runspace pool for the operations Graph still doesn't cover, with strict timeouts and the same Polly + audit pipeline.
+- Standards specific: anti-spam baseline, anti-phishing baseline, malware baseline, safe-links baseline, transport rule hardening, etc. (≥ 30 standards).
+
+#### Collaboration (Teams / SharePoint / OneDrive)
+
+- Projections: `collaboration.sites`, `collaboration.teams`, `collaboration.teams_voice` (feature-flagged), `collaboration.teams_activity`. SharePoint admin URLs cached.
+- Read surface: sites grid, site detail (members, sharing, quota), Teams grid, Teams voice (LIS locations, voice numbers), OneDrive provisioning view, sharing settings.
+- Write surface: site add (single + bulk), site delete, sharepoint settings edit, sharepoint member edit, sharepoint permissions edit, Teams add, group → Team conversion, Teams voice number assign / remove, OneDrive provision, OneDrive shortcut deploy.
+- Standards specific: external sharing posture, Teams meeting policy baseline, etc. (≥ 15 standards).
+
+#### Security
+
+- Projections: `security.alerts`, `security.incidents`, `security.defender_state`, `security.defender_tvm`, `security.secure_score_history`, `security.named_locations`, `security.tenant_allow_block_list`, `security.audit_log_searches`. Alert and incident streams are **near-real-time** (delta + push from Graph subscriptions where available).
+- Read surface: alerts grid, alert detail, incidents grid, incident detail, Defender TVM grid, secure score over time, named locations grid, allow / block list grid, audit log search results.
+- Write surface: alert state change (set), incident state change (set), CA policy add / edit / remove, CA exclusions / service-exclusions, named location add / edit / remove, allow / block list add / remove, audit log search initiate (saga), BEC check + remediate (a sensitive multi-step flow with explicit confirmations).
+- Real-time: Graph change-notification subscriptions for alerts and incidents where supported; otherwise delta on a fast cadence.
+- Standards specific: CA baseline, Defender baseline, secure-score targets, audit-log baseline, etc. (≥ 25 standards).
+- The full Standards inventory across all four domains in this phase reaches ≥ 95 additional standards on top of Phase 6's ≥ 30, getting to ≥ 125 total — well past CIPP's currently-functioning subset and on track for the 187 by Phase 11.
+
+### Out of scope
+
+- BPA migration (Phase 10).
+- PSA / RMM integrations (Phase 8).
+- Reports / analytics that aggregate across all four domains (Phase 9).
+- Multi-region performance tuning (Phase 11).
+
+### Entry criteria
+
+- Phase 6 exit criteria all green.
+- Test customer tenants representative of each domain's surface (a tenant with substantial Intune fleet; one with non-trivial Exchange policy state; one with active Defender alerts; one with broad SharePoint sharing).
+
+### Exit criteria
+
+1. Each of the four domains ships full read + write parity for the CIPP feature set documented in `README.md` (the 13-domain inventory).
+2. Per-domain projections meet the read-path SLO from Phase 3.
+3. Sensitive operations (BitLocker / LAPS recovery, mailbox restore initiation, BEC remediate) require step-up MFA at the action moment, audit to a separate lane, and are reviewable in the SuperAdmin "sensitive actions" report.
+4. The Exchange shim runspace pool sustains the bulkhead under sustained load without process-level memory regressions over a 24h soak.
+5. Real-time security alerts surface in the UI within 60 s p95 of Graph emission.
+6. ≥ 95 additional standards land alongside their domains; total ≥ 125; all three modes; all idempotent.
+7. Cross-domain tests: a Standards run that touches all four domains simultaneously respects the per-MSP bulkhead, completes within budget, and produces a single aggregated run row.
+8. Coverage `>= 80%` on each of the four domains' application + domain code.
+9. Playwright smoke covers the most-used workflow per domain (deploy a CA policy, edit a transport rule, add a SharePoint site, dismiss an alert).
+10. `MEMORY.md` updated; per-domain ADRs (0006–0009) recording any non-obvious choices.
+
+### Verification
+
+- Per-domain shadow-CIPP demo (4 separate recordings) showing parity and timing.
+- The 24h soak with the Exchange shim is run on staging; memory + handle counts before and after are within 5%.
+- A pen-test sweep against the BitLocker / LAPS / BEC sensitive flows asserting step-up enforcement.
+- A randomised property test for each domain: 1,000 random read requests across warm tenants, zero request-thread Graph paginations.
+
+### Risks
+
+- **Phase volume.** This is the largest phase. Mitigation: track the four domains as parallel work streams against the same shared infrastructure; a domain's failure to ship doesn't block the others; weekly review checkpoint per domain.
+- **PowerShell shim regressions.** Long-running runspace pools are a known memory-leak surface. Mitigation: runspaces recycle every N invocations or M minutes; a leak detector job alarms on RSS growth past a budget.
+- **Real-time alert volume.** Some tenants emit thousands of alerts/day. Mitigation: stream into a dedicated `security.alerts` partition; SignalR publish is debounced per alert id; the UI grid uses virtualised rendering.
+
+---
