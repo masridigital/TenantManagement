@@ -521,3 +521,110 @@ Both go through the same Polly pipeline and same audit hooks as the typed SDK. T
 - ❌ **Do not write a "graph_request" generic forwarder** ([CIPP-API has one](https://github.com/KelvinTegelaar/CIPP-API/blob/master/Modules/CIPPCore/Public/GraphHelper)). It is unsafe (any caller can dispatch any URL) and pointless (the SDK already does this typed).
 
 ---
+
+## 7. Auth and secret management
+
+### MSP-user sign-in (front door)
+
+- OpenID Connect against the MSP user's home Entra tenant via `Microsoft.Identity.Web.UI` (Blazor) and `Microsoft.Identity.Web` (API).
+- The app is a **multi-tenant** Entra app registration in our platform tenant. MSPs consent at first use; consent is per-MSP and tracked by tenant.
+- Sign-in resolves `tid → MspId` via `MspDirectoryLookup`. An unrecognised `tid` lands on a self-service onboarding page (only if the MSP has been provisioned), otherwise 403.
+- The sign-in cookie is **encrypted server-side** (DataProtection key in Key Vault) and short-lived (8h). Refresh is silent via the auth cookie's sliding window; re-sign-in is required after 24h regardless.
+- MFA is required at the home tenant — we don't enforce a second factor ourselves. CA policies on the home tenant are the gate. The app checks `acrs` / `amr` claims and refuses if they don't include MFA.
+
+### BFF posture — tokens never leave the server
+
+The Blazor Web App runs **server-rendered** by default, so:
+
+- Access tokens for Graph never reach the browser.
+- The browser holds only the auth cookie.
+- Calls from Interactive Server components to Graph go through the API on the server.
+- For the rare WebAssembly islands, the client uses the BFF cookie + `/api/...` calls; it never gets a Graph token.
+
+This eliminates a class of CIPP frontend issues where tokens transit the browser via Static Web Apps EasyAuth headers.
+
+### OBO for delegated Graph (the per-user case)
+
+When an MSP user clicks "list users in Customer Tenant Foo":
+
+```
+1. The API receives the request with the user's bearer token (audience: api://.../).
+2. ITokenAcquisition.GetAccessTokenForUserAsync(scopes, tenantId: foo)
+   → On-Behalf-Of flow exchanges the API token for a Graph token in
+     the Foo customer tenant, scoped to the user's GDAP relationship.
+3. The token is cached in the distributed cache (Redis-backed
+   IDistributedCache) keyed by (UserObjectId, MspId, CustomerTenantId, scope).
+4. IGraphTenantClient(MspId=msp1, CustomerTenantId=foo) hands that
+   token to the SDK.
+```
+
+OBO is the right answer for any UI-driven action: the audit trail records the **end-user** as the actor in Graph's own audit log, not a service principal. CIPP loses this because most paths run as a confidential client.
+
+### App-only for background work (the system case)
+
+Background jobs (delta sync, Standards run, Hangfire scheduled refreshers) act on behalf of the MSP, not a specific user. Auth is `client_credentials` with the platform's certificate, claiming the customer tenant as the target via the `tenant` parameter:
+
+- Cert lives in Key Vault; `Microsoft.Identity.Web` reads it at startup.
+- Token cached the same way as OBO but keyed by `(MspId, CustomerTenantId, scope)` (no user component).
+- Audit attribution: `actor: "system"`, `actor_subject: <jobId>`, `principal: app://.../{platformAppId}`.
+- The audit log clearly separates "user did X" from "scheduled job did X" so operators can answer "did a human or a robot do this?"
+
+### Refresh tokens (delegated GDAP back-office paths)
+
+Some legacy paths require a long-lived **refresh** token bound to the MSP user who consented to GDAP. These tokens:
+
+- Are **never** in environment variables. CIPP's `RefreshToken` env-var pattern is explicitly forbidden.
+- Live in `RefreshTokens` Postgres table, encrypted via `IDataProtectionProvider` (key in Key Vault, rotated annually).
+- Are accessed only through `IRefreshTokenStore`, which:
+  - Checks `MspId` matches the calling context.
+  - Decrypts in-process; the plaintext never crosses a process boundary or appears in a log line.
+  - Marks the row as `accessed_at` for audit / staleness detection.
+- Are rotated by a Hangfire job that watches expiry and runs a refresh exchange before the 90-day window closes.
+
+### Token caching
+
+```
+Layer    Store      Key                                                Purpose
+-----    -----      ---                                                -------
+L1       per-node   in-process IMemoryCache                            request-burst dedup
+L2       Redis      tenant:{mspId}:{cTenantId}:graph-token:{scope}     cluster-wide token cache
+canon    Postgres   RefreshTokens (encrypted)                          source of truth for refresh
+```
+
+`IGraphTokenProvider` coalesces token fetches: when N requests for the same `(MspId, CustomerTenantId, scope)` arrive simultaneously and L2 misses, **one** STS call happens; the rest await the result via a `SemaphoreSlim` keyed on the cache key. CIPP, lacking a real backend, pays the STS cost on every cache miss.
+
+### Secret store
+
+| Secret class | Where | Access pattern |
+| ------------ | ----- | -------------- |
+| App registration cert (private key) | Key Vault | `Microsoft.Identity.Web` reads at startup; reloaded on rotation |
+| DataProtection master key | Key Vault | ASP.NET Core DataProtection unseals refresh-token rows |
+| Postgres connection string | Key Vault reference in `appsettings.{env}.json` | Read at startup; `npgsql` connection pool |
+| PSA / RMM API keys | Postgres `IntegrationCredentials` table, encrypted via DataProtection | Read by `IIntegrationCredentialStore` per outbound call |
+| Webhook signing secrets | Same as PSA keys | Read by webhook receivers / senders |
+| MSP-tenant refresh tokens | `RefreshTokens` table, encrypted | `IRefreshTokenStore` only |
+
+Secrets **never** appear in:
+- `appsettings.*.json` (only Key Vault references).
+- environment variables (period — even local dev uses `.env` mounted as a Docker secret).
+- log lines (lint rule: `ILogger` parameters are scanned; values matching token / key / secret regex throw at compile time).
+- error messages or exception text.
+- audit log payload bodies (redaction by `IPiiRedactor`).
+- TraceId / span attributes.
+
+### Rotation
+
+- App reg certs: 90-day cycle, automated via Key Vault auto-rotate + a deploy-side reload (`X509Certificate2` is reloaded by `Microsoft.Identity.Web` without a restart).
+- DataProtection keys: 90-day cycle, automated; key history retained 1y for retroactive decrypt.
+- Postgres credentials: per-environment, rotated at deploy via Key Vault.
+- Refresh tokens: rolling refresh on use; expired-without-use beyond 60 days triggers a "reauthorize" notice on the MSP's settings page.
+
+### Anti-rules
+
+- ❌ Refresh tokens in env vars.
+- ❌ Plaintext secrets in `appsettings.{env}.json`.
+- ❌ Static (non-rotating) symmetric secrets for service-to-service.
+- ❌ A custom token cache (`CIPPSharp.dll`-equivalent). The `IDistributedCache` + `Microsoft.Identity.Web` cache provider is the cache.
+- ❌ `Console.WriteLine`-ing a token "to debug." There is no scenario in which this is acceptable.
+
+---
