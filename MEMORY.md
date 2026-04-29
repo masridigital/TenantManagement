@@ -8,14 +8,71 @@
 
 ## Active state
 
-- **Phase:** Pre-Phase 0 (Planning)
-- **Branch:** `claude/analyze-cipp-repos-UzlQB`
-- **Current goal:** Land the seven planning documents (README, CLAUDE, ARCHITECTURE, PHASES, MEMORY, FEEDBACK, REBUILD_PLAN) so Phase 0 can begin from a complete brief.
-- **Next concrete task:** Author `ARCHITECTURE.md`, then `PHASES.md`, then `REBUILD_PLAN.md`.
+- **Phase:** Pre-Phase 0 (Planning) — **planning workspace complete**
+- **Branch:** `claude/review-cipp-repos-1iNqQ`
+- **Current goal:** Planning documents are landed. Next session opens Phase 0 (Foundations).
+- **Next concrete task:** Begin Phase 0 per `PHASES.md` — solution skeleton, infra-as-code, CI/CD, observability — no business code. Start with the .NET 10 solution layout and the Bicep modules in parallel.
 
 ---
 
 ## Session log
+
+### 2026-04-29 (cont.) — ARCHITECTURE / PHASES / REBUILD_PLAN landed section by section
+
+**Goal:** Complete the remaining three planning documents that prior session deferred, with each section pushed individually so the trail is incremental and reviewable.
+
+**Done this session:**
+- Authored `ARCHITECTURE.md` end to end (15 sections, ≈ 970 lines), pushed section by section:
+  - §0 Thesis (the four pillars: real cache / real backend / real auth posture / real distribution).
+  - §1 System context — actors, data classes, upstream dependencies, in/out interfaces, explicit out-of-scope.
+  - §2 Bounded contexts — the 13-context map replacing CIPP's ~380 unstructured Functions; cross-context rules (no shared DbContext, no entity reach-through).
+  - §3 Cache hierarchy and read path — L1/L2/L3 + bounded fallback; resolution order; freshness windows; key conventions; anti-rules.
+  - §4 Write path — five steps (authorize / write-ahead audit / Graph / projection-update-in-same-txn-as-audit-flip / invalidate+notify); idempotency; bulk batching; compensating-action policy.
+  - §5 Multi-MSP isolation — five-layer defense (auth, MspContextAccessor, EF filters with lint-enforced bypass, ICustomerTenantAuthorizationService, Graph token scoping); platform-admin escape hatch.
+  - §6 Graph integration — what the SDK already gives us, the thin IGraphTenantClient, Polly v8 pipeline composition, the pagination / batch / delta rules, anti-rules forbidding hand-rolled OAuth / pagination / batch / delta / generic graph forwarders.
+  - §7 Auth and secret management — BFF posture, OBO vs client_credentials, three-tier token cache with SemaphoreSlim coalescing, encrypted IRefreshTokenStore, secret-store layout, rotation cadence.
+  - §8 Background processing — Hangfire / Service Bus / code-defined sagas with rationale per choice; per-tenant warmer scheduler; per-MSP fan-out bulkhead; outbox pattern; anti-rules forbidding handler-by-name dispatch.
+  - §9 Persistence — schema-per-context layout, mandatory multi-tenant columns, typed-vs-jsonb decision rule, indexing, time-partitioning, soft-delete, no-startup-migration policy, optimistic concurrency.
+  - §10 SignalR; §11 Observability (logs / metrics / traces + audit as a separate first-class data class); §12 Deployment topology and blue-green; §13 Failure modes and DR (RTO/RPO targets); §14 one-paragraph summary; §15 document conventions.
+- Authored `PHASES.md` end to end (≈ 1,000 lines), pushed phase by phase:
+  - Header + reading guide + cross-phase rules + phase index.
+  - Phase 0 Foundations → Phase 12 GA / launch, each with the five sub-sections (scope, out-of-scope, entry, exit, verification) plus a per-phase risks block.
+  - Cross-cutting tracks (docs / ADRs / security review / perf / a11y / i18n / telemetry hygiene) and the explicit "what we are deliberately not doing" list.
+  - Append-only update protocol.
+- Authored `REBUILD_PLAN.md` end to end (≈ 415 lines), pushed section by section:
+  - §1 Executive summary (what / why / how / when / who).
+  - §2 Full CIPP audit (repository inventory, backend findings, frontend findings, issue / discussion references, security posture, balanced acknowledgement of what CIPP does well).
+  - §3 Rebuild thesis with each architectural choice mapped explicitly to the audit finding it addresses.
+  - §4 Timeline view (phase progression, "minimum credible product" line at Phase 4 exit, gates, parallel tracks).
+  - §5 Strategic risk register (architectural / operational / product / people).
+  - §6 Success criteria (technical SLOs / product / operational / strategic outcomes).
+  - §7 Reading order for new joiners.
+  - §8 Append-only update protocol.
+
+**Decisions logged this session:**
+- Section-by-section commit cadence is the project's norm for planning docs going forward (the trail must be incremental and reviewable). Encoded in each doc's update protocol.
+- Phase ordering and the 13-phase index are now formally adopted as the project plan; reordering requires an ADR.
+- "Minimum credible product" is defined at Phase 4 exit (Identity domain end-to-end). This is the inflection where architectural investment becomes user-visible product.
+- Standards count target: ≥ 30 in Phase 6, ≥ 95 more in Phase 7, full 187+ by Phase 11.
+
+**Blocked / open questions:**
+- ADR-0001 (tech stack) needs to land at the start of Phase 0 with the formal sign-off; the rationale lives in `README.md` and `CLAUDE.md` but the ADR makes it canonical for future deviations.
+- The active-active multi-region story is deferred to a post-GA phase; the data architecture supports it but the operational burden isn't justified at launch.
+
+**Next session should:**
+1. Read `MEMORY.md` (this file).
+2. Read `FEEDBACK.md` (the three foundational directives still apply: no Graph wrapper rebuild, cache as centerpiece, auth complexity is an artifact).
+3. Open Phase 0 per `PHASES.md`. Concrete first PR: solution skeleton + nullable-enabled / implicit-usings / TreatWarningsAsErrors / LangVersion latest baseline + a green `dotnet build` and `dotnet test` (with empty test projects) on CI.
+4. In parallel: ADR-0001 (tech stack) lands with the team's sign-off.
+5. Update this file at end of session.
+
+**Files touched this session:**
+- `ARCHITECTURE.md` (created, 15 sections)
+- `PHASES.md` (created, 13 phases + cross-cutting + close)
+- `REBUILD_PLAN.md` (created, 8 sections)
+- `MEMORY.md` (this update)
+
+---
 
 ### 2026-04-29 — Initial planning workspace
 
