@@ -121,3 +121,126 @@ A balanced audit acknowledges what works:
 These do not change the structural verdict, but they shape **how** the rebuild is positioned: a respectful successor, not a replacement-by-disparagement.
 
 ---
+
+## 3. The rebuild thesis
+
+Each finding from §2 maps to a specific architectural choice. None is a tactical "fix that one thing" — they are structural, and structurally addressed.
+
+### 3.1 The cache is the centre of gravity
+
+**Finding addressed:** §2.4 (`#1064`, `#2883`, Discussion `#4979`).
+
+CIPP's binary choice is: paginate-Graph-then-render (slow first paint, blocks at scale) or paginate-on-demand (fast first paint, slow steady-state, no shared cache). There is no third option for that architecture **because the architecture has no place to keep cache state across requests**.
+
+A real .NET backend changes the equation entirely. The rebuild's read path is:
+
+- **L1 IMemoryCache** for in-process burst dedup.
+- **L2 Redis** for cluster-wide hot reads.
+- **L3 Postgres typed projections** as the durable cache, refreshed by **background Graph delta workers**.
+- A **bounded fallback** to one Graph page only for newly-onboarded "cold" tenants.
+
+The request thread **never paginates Graph**. Pages render from the projection with a "data refreshed N minutes ago" footer. After the first warm cycle, every subsequent read is a database/Redis operation, not an API operation. Writes go through Graph, then update the projection in the same Postgres transaction as the audit-log status flip, then invalidate L2, then publish a SignalR refresh. (`ARCHITECTURE.md` §3, §4.)
+
+**Why this works structurally**: CIPP cannot do this not because no-one thought of it, but because the runtime cannot host the projection layer. The rebuild's runtime can.
+
+### 3.2 The SDK is the abstraction; we don't re-abstract it
+
+**Finding addressed:** §2.2 (700+-branch Graph proxying; per-file token plumbing; SAM ceremony).
+
+Roughly 90% of CIPP-API is hand-rolled Graph plumbing: pagination via `nextLink` chasing, batch via custom helpers (which silently lose inner 429s), retry / `Retry-After` honouring per file, scope and app-registration wrangling. **All of this is solved primitives in `Microsoft.Graph` SDK v5 and `Microsoft.Identity.Web`**:
+
+- `PageIterator<T>` — pagination + throttling + `Retry-After`.
+- `BatchRequestContent` with per-subresponse status inspection.
+- `Delta()` extensions on every paged resource.
+- OBO, refresh, certificate, MSI, confidential-client OAuth.
+- Distributed token cache with the standard `IDistributedCache` provider.
+
+The rebuild's only owned abstraction is `IGraphTenantClient` — a per-`(MspId, CustomerTenantId)` factory that:
+1. Carries tenant identity for telemetry.
+2. Wraps the request adapter in a Polly v8 pipeline (bulkhead per MSP, rate limiter per customer tenant, retry, circuit breaker — `ARCHITECTURE.md` §6).
+3. Forces batch subresponse inspection (so the inner-429 silent-failure bug class is impossible).
+4. Audits every Graph call.
+
+It does **not** wrap individual Graph operations. Application code calls `_client.Client.Users.PostAsync(...)` — straight SDK. (`CLAUDE.md` §8b — "the 'just a Graph wrapper' rule".)
+
+**Why this works structurally**: every line of plumbing we don't write is a line we don't have to test, secure, or maintain. The SDK has Microsoft's full-time team behind it.
+
+### 3.3 Auth complexity collapses when the language has the primitives
+
+**Finding addressed:** §2.2 (SAM ceremony, env-var refresh tokens, `CIPPSharp.dll` token cache).
+
+The CIPP "auth complexity" — scope soup, app-registration wrangling, per-tenant token plumbing, refresh-token-into-env-var, the bespoke token cache — exists because PowerShell didn't have first-class confidential-client identity primitives. .NET does. The rebuild's auth shape is:
+
+- `Microsoft.Identity.Web` for OIDC sign-in (BFF posture: tokens never reach the browser).
+- `IConfidentialClientApplication` + `ITokenAcquisition` for OBO (per user) and `client_credentials` (per worker).
+- `IDistributedCache` (Redis) for token caching, with `SemaphoreSlim` coalescing so concurrent acquisitions become one STS call.
+- `IRefreshTokenStore` over `IDataProtectionProvider`-encrypted Postgres rows for the rare long-lived-refresh-token cases. **Refresh tokens never appear in environment variables.** A grep step in CI fails the build if they do.
+- Token rotation is a Hangfire scheduled job, not a "rerun the setup wizard" recovery story.
+
+(`ARCHITECTURE.md` §7. `FEEDBACK.md` 2026-04-29 directive 3.)
+
+**Why this works structurally**: the SAM wrapper is mitigation for missing language primitives. The primitives exist now. The mitigation goes away.
+
+### 3.4 Bounded contexts replace flat function dumps
+
+**Finding addressed:** §2.2 (533 flat `Invoke-*.ps1` files, no controller registry).
+
+The rebuild collapses ~380 unstructured Azure Functions to **13 bounded contexts**, each with its own MediatR handlers, DTOs, validators, projections, and background jobs. (`ARCHITECTURE.md` §2.) The endpoint count drops by an order of magnitude not because we lose features but because:
+
+- One handler replaces many one-off `Invoke-*.ps1` files (one `UsersController` group, not 22 user-related files).
+- "Get a list" + "get one" + "delta since cursor" share one query handler with a parameter, not three files.
+- Sub-resources are URL nesting, not new top-level endpoints.
+
+Cross-context reads go through public DTOs; there are no cross-context FKs and no shared `DbContext`. Domain events are how contexts react to each other.
+
+**Why this works structurally**: at 533 files the project doesn't fit in a single mental model. At 13 contexts, each context fits in one engineer's head, and a new feature lives in one context, not across the whole repo.
+
+### 3.5 Standards as a typed registry, not 187 PowerShell files
+
+**Finding addressed:** §2.2 (187 standards files, no shared base, reflection on file names).
+
+Each standard becomes one C# class implementing `IStandardHandler`, decorated with `[Standard("Name", Category = ...)]`, with three modes (Report / Remediate / Alert), typed settings, and JSON-Patch drift detection against a stored baseline. (`CLAUDE.md` §8.) The orchestrator enforces "no remediate without a successful prior report in the same run." Templates live in Postgres `jsonb` (no 64 KB ceiling).
+
+**Why this works structurally**: every standard is independently testable, the registry is enumerable, drift is a first-class concept rather than something the human has to spot in a report, and templates can be larger than 64 KB.
+
+### 3.6 Postgres replaces Azure Tables for everything that matters
+
+**Finding addressed:** §2.2 (64 KB Table row limit; no joins, no indexes, no FK integrity); §2.4 Issue `#1806`.
+
+PostgreSQL via EF Core 10 + Npgsql for relational data. `jsonb` for the small set of legitimately schemaless data (per-standard settings, template payloads, drift diffs) — never for "the cached Graph response we'll re-parse on every read." Typed columns, indexes covering the queries the UI actually issues, time-partitioned audit / activity tables, soft-delete by default, and migrations as a CI step (never on app startup outside dev). (`ARCHITECTURE.md` §9.)
+
+**Why this works structurally**: relational integrity, real indexing, and TTL-aware caching are foundations the runtime denies CIPP. Once those exist, the cache hierarchy in 3.1 is possible.
+
+### 3.7 Multi-MSP isolation in five layers
+
+**Finding addressed:** §2.5 (security posture mismatch); cross-MSP blast-radius ambient in CIPP.
+
+Cross-MSP data access is impossible by construction, not by remembering to add a `where`-clause. Five independent layers, each individually sufficient: OIDC `tid → MspId` mapping; `MspContextAccessor` ambient; EF global query filters with a lint-enforced `IgnoreQueryFilters` allow-list; `ICustomerTenantAuthorizationService.AssertAccessAsync`; Graph token scoping per `(MspId, CustomerTenantId)`. (`ARCHITECTURE.md` §5.)
+
+**Why this works structurally**: security review can't reason about correctness across an ambient hashtable threading through a function app. It can reason about a five-layer model where every layer is named, tested, and visible.
+
+### 3.8 Managed SaaS, no fork-and-deploy
+
+**Finding addressed:** §2.2 ("self-host-by-fork breaks on every major release"); §2.5 (coordinated security response across forks is structurally impossible).
+
+The rebuild ships as a managed multi-MSP SaaS first; a self-host container image is a secondary distribution. Self-host upgrade is "pull a tagged image; the migrator runs migrations; restart" — not "rebase against upstream and resolve conflicts." There are no per-MSP forks to coordinate a security update across. (`PHASES.md` Phase 12.)
+
+**Why this works structurally**: a single deployable surface is the only way to make a coordinated CVE response across the install base feasible. The fork model can never get there.
+
+### 3.9 SignalR replaces polling
+
+**Finding addressed:** §2.3 (polling toll on the function app at scale).
+
+Per-domain SignalR hubs with Redis-backed backplane; the UI joins MSP- and tenant-scoped groups; writes publish progress and invalidations; reads reconcile on the next L2/L3 fetch (which is now correct because the write path invalidated cache before publishing). SignalR is best-effort low-latency; correctness is in the cache and audit, not in the broadcast. (`ARCHITECTURE.md` §10.)
+
+**Why this works structurally**: pushing changes is far cheaper at scale than polling for them, both for compute and for client experience.
+
+### 3.10 Audit is a first-class data class, not a log line
+
+**Finding addressed:** §2.5 (audit log in Azure Tables with the same 64 KB / pagination caveats); operational forensics gap.
+
+Audit log is a typed, queryable, retained data class in Postgres with 7-year retention and monthly partition archival to Blob. Every command and every Graph mutation writes an audit row in the same Postgres transaction as the projection update. Schema is typed (`actor`, `command`, `target`, `outcome`, `status`, `payload`, `traceId`); cross-MSP read access requires SuperAdmin + ticket id. (`ARCHITECTURE.md` §11.)
+
+**Why this works structurally**: audit-as-log is unsearchable at scale. Audit-as-data is the substrate for forensics, compliance, and customer-facing transparency.
+
+---
