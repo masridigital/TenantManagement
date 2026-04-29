@@ -896,3 +896,93 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **Sunset hostility.** MSPs feel forced to migrate. Mitigation: Standards is genuinely better, and the migration tool does most of the work; the deprecation period is generous.
 
 ---
+
+## Phase 11 — Hardening, scale, multi-region readiness
+
+**Goal:** Take the platform from "feature complete" to "we can put real customers on it." Soak the system at GA-equivalent load, run failure-mode drills end-to-end, tune the resilience pipeline against real telemetry, plug observability gaps, and deliver the multi-region story (active-passive first; active-active deferred to a post-GA phase).
+
+### Scope
+
+#### Soak and load
+
+- Synthetic GA-load profile: 200 MSPs × 100 customer tenants average, peak 5x baseline burst, sustained 24 h.
+- Read path verified to honour Phase 3's SLO (p95 ≤ 250 ms warm) at GA load.
+- Write path verified at sustained 100 writes/sec across the platform with audit and projection consistency.
+- Hangfire warmer schedule re-tuned from real timings; per-resource freshness windows adjusted; documented in `docs/operations/cache-tuning.md`.
+- Polly pipeline numbers (bulkhead concurrency, rate-limiter capacity) re-tuned against real Graph quota observations; documented.
+
+#### Chaos / DR drills
+
+- **Postgres primary loss:** trigger a failover; assert the read banner, the write pause, the resume; measure RTO; target ≤ 15 min.
+- **Redis loss:** drop the Redis service; observe L1+L3 absorbing reads; observe Hangfire stalling and resuming; reconnect; warm-back; measure latency increase during the window.
+- **Service Bus loss:** observe the outbox queue growing; reconnect; observe drain; verify no message loss.
+- **Region-wide loss:** failover to the secondary region (active-passive); restore writes; measure RTO and RPO; target RTO ≤ 30 min, RPO ≤ 5 min.
+- **Refresh-token leak simulation:** trigger `RevokeAll(mspId)`; assert reconsent flow; verify forensics dashboard shows the affected window cleanly.
+- **Data-protection key compromise simulation:** rotate forward; verify decrypt path under the new key; old ciphertext is dead-on-arrival.
+- **Bad-deploy rollback:** introduce a deliberate regression in canary; revision-rollback; verify recovery without manual intervention.
+
+#### Multi-region (active-passive)
+
+- Bicep modules extended to deploy a second region with: read-replica Postgres (logical replication from primary), Redis (cold), Service Bus geo-pair, App Insights paired.
+- Front Door routing rules with health-checked failover.
+- Documented runbook for region failover.
+- Cost model for active-passive included in `docs/operations/multi-region-cost.md`.
+
+#### Security audit
+
+- Internal pen-test sweep (the same scripts as previous phases, plus new ones aimed at the seams).
+- External pen-test engagement scheduled (results, when received, drive remediation in a Phase 11.x).
+- SECURITY.md and the coordinated-disclosure programme drafted (full launch in Phase 12).
+- Static analysis baseline: zero high-severity findings; medium-severity tracked.
+- Dependency scan baseline: zero known-CVE vulnerabilities in production dependencies.
+
+#### Observability completeness
+
+- Every metric in `ARCHITECTURE.md` §11 is shipping with a dashboard.
+- SLO dashboards published: read-path p95 / p99, write-path p95 / p99, warmer queue depth, Graph throttle rate, delta failure rate, auth denial rate, error budget burn.
+- Alert routing: PagerDuty / Opsgenie integration; on-call schedule; runbook links per alert.
+
+#### Self-host parity
+
+- The self-host container image is verified to run on a single VM with Docker Compose and reach feature parity with the SaaS for the test MSP.
+- `docker-compose.yml` published; documentation updated.
+- Self-host upgrade story documented (pull a tagged image; the migrator runs migrations; restart). No fork.
+
+### Out of scope
+
+- Active-active multi-region (deferred to a post-GA phase; the data architecture supports it but the operational burden isn't justified at launch).
+- A formal SOC 2 audit (pursued post-GA once the platform has audit-trail history; the controls are in place from day one but the audit happens after sufficient evidence accumulates).
+- Marketing site / public docs (Phase 12).
+
+### Entry criteria
+
+- Phase 10 exit criteria all green.
+- A staging environment provisioned at the scale of the GA-load profile.
+- Synthetic load-generation tooling capable of the planned scenarios.
+- A second Azure region designated for the active-passive setup.
+
+### Exit criteria
+
+1. The 24h soak completes within budget and within all SLOs.
+2. Every chaos / DR drill in scope completes successfully and produces a runbook page in `docs/operations/runbooks/`.
+3. Region failover is exercised end-to-end with no permanent data loss; RTO and RPO targets met.
+4. Polly + warmer tuning numbers are committed to source control with a `docs/operations/tuning.md` rationale doc.
+5. Static analysis and dependency scans are clean.
+6. SLO dashboards are published and on-call alerts route correctly.
+7. Self-host upgrade succeeds end-to-end against a previous tagged image.
+8. Pen-test sweep produces an empty critical/high finding list (medium findings tracked but not blocking).
+9. `MEMORY.md` updated; one consolidated ADR (0012) covers the multi-region active-passive design.
+
+### Verification
+
+- Live recordings of each chaos drill.
+- A signed-off operations review with stakeholders showing every dashboard, every runbook, and the failover demo.
+- A go / no-go meeting against the GA checklist.
+
+### Risks
+
+- **Soak surfaces a perf regression.** Mitigation: budget two extra weeks for tuning; the phase is not done until SLOs hold under sustained load, not just average load.
+- **Region failover is harder than expected.** Mitigation: dry-run the failover in staging at least three times before the prod cut. Document explicit "do not do this" branches.
+- **Pen-test surfaces a structural issue.** Mitigation: structural findings escalate to a phase scope reopen; we do not ship structural risk into GA.
+
+---
