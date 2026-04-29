@@ -666,3 +666,92 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **Real-time alert volume.** Some tenants emit thousands of alerts/day. Mitigation: stream into a dedicated `security.alerts` partition; SignalR publish is debounced per alert id; the UI grid uses virtualised rendering.
 
 ---
+
+## Phase 8 — Automation and integrations
+
+**Goal:** Make the platform an active participant in an MSP's tooling ecosystem rather than just a console. Scheduled jobs the MSP can author and modify, webhook receivers that bridge external events into alerts and audit, and outbound integrations with the PSAs / RMMs / billing systems that MSPs already run on. CIPP has all of this; the rebuild does it with typed adapters, signed payloads, and per-integration bulkheads.
+
+### Scope
+
+#### Scheduler UI
+
+- A scheduled-items grid: list, create, edit, run-now, pause, delete.
+- Item types: standards run, BPA run, report generation, custom Graph batch (typed parameters, never an arbitrary URL forwarder), webhook fanout, alert configuration evaluation.
+- Cron-style schedule with timezone awareness; "run on the first Tuesday of the month at 09:00 in the MSP's timezone".
+- Run history per item, with outcome, duration, and any per-tenant breakdown (for fan-out items).
+- Pause/resume preserves cron alignment.
+- Per-item idempotency keys: a missed run is **not** retroactively executed; the next aligned tick runs.
+
+#### Alert configurations
+
+- An alert configuration is `(MspId, Trigger, Filter, Action[])`.
+- Triggers: standards drift, security alert, sign-in anomaly, license usage threshold, scheduled job failure, GDAP relationship change, integration health.
+- Filter: tenant scope + condition expression (typed; not free-text PowerShell).
+- Actions: SignalR-only, email, Teams webhook, Slack webhook, PSA ticket creation, custom HTTP webhook with signed payload.
+- All actions are queued via Service Bus; fire-and-forget but auditable.
+
+#### Webhook receivers (`hooks.{domain}/v1/{provider}`)
+
+- Per-provider HMAC signature verification (the secret rotates; both old and new accepted during a 7-day window).
+- Replay protection: nonce + timestamp window (5 min); duplicate nonces rejected.
+- Provider-specific payload shape parsed into a typed event; unknown shapes audit and 400.
+- Standard providers wired: Microsoft (Defender, M365 audit log routing), Halo, NinjaOne, Pax8, Hudu, IT Glue, Datto, Microsoft Service Health.
+- A "generic" receiver for MSP-defined webhooks accepts a JSON body, validates against an MSP-provided JSON Schema, and emits an internal event.
+
+#### Outbound integrations
+
+- Per-integration adapters in `TenantManagement.Integrations.<Provider>` projects, each with a typed `IIntegrationAdapter`.
+- Standard adapters in scope this phase:
+  - **Halo** — ticket create / update / link.
+  - **NinjaOne** — alert create, organisation sync.
+  - **Pax8** — license sync, billing usage report.
+  - **Hudu** — page sync (per-tenant documentation export).
+  - **IT Glue** — flexible-asset sync.
+  - **Datto** — alert ingest (incoming) + ticket sync (outgoing).
+- All adapters share a per-integration bulkhead so a slow PSA cannot stall the rest of the platform.
+- All adapters store credentials in `automation.integration_credentials`, encrypted via DataProtection (no plaintext in `appsettings.*.json`, no env vars).
+- Health surface: an integrations dashboard showing per-MSP per-integration last-success / last-failure / queue depth.
+
+#### Email & Teams
+
+- Outbound email via Graph `sendMail` from a platform mailbox (delegated, signed, DKIM-aligned at the platform domain).
+- Teams / Slack webhooks: signed, replayable, with per-MSP rate caps.
+- The default recipient list per alert configuration is configurable per MSP.
+
+### Out of scope
+
+- A "run any cmdlet name from a queue payload" generic dispatcher (CIPP's `& $cmdletName @args` pattern). **Forbidden.** Every scheduled item is one of a typed set.
+- Reports / analytics surface (Phase 9).
+- BPA legacy bridge (Phase 10).
+
+### Entry criteria
+
+- Phase 7 exit criteria all green.
+- Test sandbox accounts available for Halo, NinjaOne, Pax8, Hudu, IT Glue, Datto.
+- Microsoft Service Health webhook endpoint registered.
+
+### Exit criteria
+
+1. An MSP authors a scheduled item that runs a Standards template across all tenants every Sunday at 02:00 in their timezone; the next run executes correctly; missed runs (paused over a window) do not retroactively execute.
+2. An alert configuration triggered by drift on Standard X creates a Halo ticket within 60 s p95.
+3. A Datto inbound webhook arrives, is verified, parsed, deduplicated, and surfaces in the activity feed.
+4. Each integration's credentials cycle through rotation without MSP intervention; a rotation event audits.
+5. A purposefully misbehaving integration (slow, returning 5xx) trips its bulkhead within budget; the rest of the platform remains healthy; the integrations dashboard surfaces the state.
+6. Webhook signature verification rejects payloads with bad signatures, expired nonces, or replayed nonces; each rejection audits.
+7. Per-integration coverage `>= 70%` (lower than core because adapters are heavily mocked at the boundary; integration tests use VCR-style cassettes).
+8. The "generic" MSP-defined webhook validates against the MSP's JSON Schema; non-conforming payloads return 422 with a typed problem-details response.
+9. `MEMORY.md` updated; ADR-0010 records the integration-adapter contract and the bulkhead-per-integration rule.
+
+### Verification
+
+- An end-to-end recorded scenario: drift detected → alert configuration triggered → Halo ticket opened → Hudu page updated → Slack message sent → activity feed shows the chain.
+- A chaos test that takes Halo offline for 30 minutes; observe other integrations are unaffected; observe Halo work queues drain on recovery.
+- Replay-attack test against each provider's webhook receiver; all rejected.
+
+### Risks
+
+- **Adapter shape churn.** PSA APIs evolve. Mitigation: each adapter has a typed surface; version pin; integration tests run nightly against sandbox accounts; adapter version mismatches fail fast at startup with a clear "PSA X needs adapter v2.x" message.
+- **Webhook spam.** A misconfigured external system can flood our receivers. Mitigation: per-MSP per-provider rate cap with shed-load behaviour; audited 429 responses.
+- **Misuse of "generic" webhooks.** A loose schema is an injection vector. Mitigation: schema is enforced; payload is parsed into a typed envelope; downstream handlers receive only the typed shape, never a raw blob.
+
+---
