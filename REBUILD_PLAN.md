@@ -244,3 +244,164 @@ Audit log is a typed, queryable, retained data class in Postgres with 7-year ret
 **Why this works structurally**: audit-as-log is unsearchable at scale. Audit-as-data is the substrate for forensics, compliance, and customer-facing transparency.
 
 ---
+
+## 4. Timeline view across phases
+
+The full phase detail (scope / out-of-scope / entry / exit / verification / risks per phase) lives in `PHASES.md`. This section is the at-a-glance roll-up and shows how the phases reinforce one another.
+
+### 4.1 Phase progression
+
+```
+Phase 0   Foundations              ░░░░░░░░░░░░░░░░░░░░  empty deployable, green CI
+Phase 1   Auth & tenancy           ▓▓▓░░░░░░░░░░░░░░░░░  signed-in users, MSP context, refresh-token store
+Phase 2   Graph integration core   ▓▓▓░░░░░░░░░░░░░░░░░  IGraphTenantClient, Polly, batch, delta cursors
+Phase 3   Caching & projections    ▓▓▓░░░░░░░░░░░░░░░░░  L1/L2/L3 + warmer; users as the reference
+Phase 4   Identity domain          ▓▓▓▓░░░░░░░░░░░░░░░░  first end-to-end UI surface
+Phase 5   Tenants domain           ▓▓▓▓░░░░░░░░░░░░░░░░  onboarding saga, GDAP, all-tenants grids
+Phase 6   Standards engine         ▓▓▓▓▓░░░░░░░░░░░░░░░  typed registry, three modes, drift, templates
+Phase 7   Endpoint Mgmt + ExO +    ▓▓▓▓▓▓▓▓░░░░░░░░░░░░  largest phase: four customer-tenant domains
+          Collab + Security
+Phase 8   Automation & integrations ▓▓▓▓░░░░░░░░░░░░░░░  scheduler, webhooks, PSA/RMM adapters
+Phase 9   Reports & analytics      ▓▓▓░░░░░░░░░░░░░░░░░  cross-tenant rollups, scheduled exports
+Phase 10  BPA migration            ▓▓░░░░░░░░░░░░░░░░░░  legacy compatibility + one-way migration
+Phase 11  Hardening & multi-region ▓▓▓▓░░░░░░░░░░░░░░░░  soak, chaos, DR drills, active-passive
+Phase 12  GA / launch              ▓▓▓░░░░░░░░░░░░░░░░░  pricing, public docs, security disclosure
+```
+
+**Engineering weeks (3-engineer team):** approximately **48 weeks** elapsed in total. Calendar duration depends on team size; the **order is non-negotiable** because each phase's exit criteria are entry criteria for the next.
+
+### 4.2 The "minimum credible product" line
+
+If we drew a line for the first phase at which the product could be put in front of a friendly design partner, it would be **after Phase 4** (Identity domain shipped end-to-end). At that point a partner can sign in, manage users / groups / devices on real tenants, and feel real performance. This is the inflection point where the architectural investments of Phases 0–3 pay back as a visible product, and where feedback loops with real users start.
+
+The phases between Phase 4 and Phase 12 are all about expanding feature surface and hardening — the architectural shape is set by Phase 3.
+
+### 4.3 What gates the timeline
+
+The timeline is gated, in order, by:
+
+1. **Entra ID app registration consent process.** Phase 1 cannot complete until multi-tenant consent works end-to-end. Mitigation: this is started in parallel with Phase 0.
+2. **A representative test customer tenant with realistic fleet.** Phases 3+ need ≥ 1,000 users / ≥ 200 devices etc. for the perf claims to be meaningful. Mitigation: provisioning tooling lands in Phase 0.
+3. **Partner Center sandbox availability.** Phase 5 onboarding saga needs a working invite flow against a sandbox. Mitigation: provision early in Phase 2.
+4. **Pen-test scheduling.** Phase 11 includes an external pen-test; the calendar slot is booked at the start of Phase 9 to avoid being the long pole at the end.
+5. **Stripe / billing integration.** Phase 12 needs a production Stripe account and legal review of pricing terms. Mitigation: legal kicks off in Phase 10.
+
+### 4.4 Parallel tracks
+
+Some work threads run continuously alongside the phase work:
+
+- **Documentation.** Each phase updates `docs/` for its surface; a phase isn't done if its docs are missing.
+- **ADRs.** Non-trivial decisions get an ADR. Numbering is chronological.
+- **Security review.** Each phase has a checkpoint at exit; the `/security-review` skill runs before merge.
+- **Performance budgets.** Phases touching UI verify the budget; drift is investigated, not normalised.
+- **Accessibility.** WCAG 2.2 AA across every shipping page; verified with axe-core in CI.
+- **Internationalisation.** Strings extracted into resources from day one; English first.
+- **Telemetry hygiene.** No metric without a dashboard, no log line without an event id, no alert without a runbook.
+
+(See `PHASES.md` "Cross-cutting tracks".)
+
+---
+
+## 5. Risks and how we manage them
+
+A risk register at the strategic level — phase-level risks live in `PHASES.md` per phase. Each strategic risk has a category, the failure mode, and the structural mitigation.
+
+### 5.1 Architectural risks
+
+| Risk | Failure mode | Mitigation |
+| ---- | ------------ | ---------- |
+| The cache hierarchy is over-engineered for our actual load | We pay complexity cost without a return | Phase 3 ships **users only** as the reference; subsequent resources copy the pattern only if they meet the same bar. |
+| Standards engine doesn't reach the breadth CIPP has | MSPs can't migrate, churn back to CIPP | Phase 6 ships ≥ 30 standards; Phase 7 brings ≥ 95 more alongside their domains; Phase 11 closes the gap to 187 total. |
+| Real-time push (SignalR) loses messages in flight | UI shows stale state until next page nav | SignalR is best-effort by design; the cache + audit are the correctness layer; UI grids reconcile on next read |
+| Multi-region adds operational burden we can't carry | On-call drowns | Active-passive only at GA; active-active deferred until measured load justifies it |
+
+### 5.2 Operational risks
+
+| Risk | Failure mode | Mitigation |
+| ---- | ------------ | ---------- |
+| Graph quota changes (Microsoft tightens limits) | Fan-out work degrades fleet-wide | Per-MSP bulkhead + per-tenant rate limiter; degrade gracefully to L3 reads with banners; SLO dashboards alarm before user impact |
+| Postgres failover takes longer than RTO | Customer-visible outage | Failover drilled in Phase 11; runbook in `docs/operations/runbooks/`; automated promotion script |
+| Refresh-token leak | Cross-customer compromise | Tokens DataProtection-encrypted in Postgres, never in env; rotation by Hangfire job; revoke-all-by-MSP path drilled in Phase 11 |
+| Bad deploy reaches prod | Downtime / data corruption | Migrations are a CI step before deploy; Container Apps revision rollback in 1 click; canary + soak before traffic shift |
+
+### 5.3 Product risks
+
+| Risk | Failure mode | Mitigation |
+| ---- | ------------ | ---------- |
+| MSPs don't migrate from CIPP because their workflows are entrenched | Slow customer ramp | Phase 10 ships a forward-compatible BPA surface and one-way migration tooling; the rebuild is positioned as a respectful successor, not a replacement-by-disparagement |
+| Pricing miscalibration | First-month churn | Design-partner cohort in Phase 12 is the canary; pricing is reviewable post-launch; trial flow with no card |
+| Feature parity gaps surfaced post-launch | Customer-visible regressions | Shadow-CIPP demos at each phase exit (P4 onward); the rebuild's feature inventory tracks CIPP's surface explicitly in `README.md` |
+
+### 5.4 People risks
+
+| Risk | Failure mode | Mitigation |
+| ---- | ------------ | ---------- |
+| Single-engineer dependency on cache / Graph / Standards subsystems | Bus factor of one | Pair-rotation per phase; ADRs document non-obvious choices; runbooks for every operational surface |
+| Burnout on a 48-week build | Quality drop, missed exits | Phases are sized so each one ships something tangible; cross-cutting tracks prevent perpetual debt; a phase can extend rather than compress |
+| External pen-test reveals a structural issue | Late-stage rework | Internal pen-test sweeps at every phase exit; the external test in Phase 11 should not be the first time a security perspective sees the system |
+
+---
+
+## 6. Success criteria
+
+What does it look like when this works?
+
+### 6.1 Technical SLIs / SLOs at GA
+
+| Metric | Target |
+| ------ | ------ |
+| Read-path p95 latency over warm cache | ≤ 250 ms |
+| Read-path p99 latency over warm cache | ≤ 600 ms |
+| UI page render p95 (warm) | ≤ 500 ms |
+| Write-path p95 (audit-ack to projection-ack) | ≤ 800 ms |
+| Graph throttle rate | ≤ 0.5% of calls |
+| Delta sync failure rate | ≤ 5% (alarm threshold) |
+| L2 cache hit ratio (lists) | ≥ 90% over warm population |
+| Auth denial false-positive rate | ≤ 0.1% |
+| Soak: sustained 24h at GA load | Zero SLO violations |
+
+### 6.2 Product outcomes
+
+- A friendly design-partner MSP onboards a 100-tenant customer fleet in < 1 day end-to-end.
+- The all-tenants user list page renders in ≤ 800 ms p95 for that 100-tenant MSP — i.e., the headline CIPP perf complaint is gone.
+- An MSP can run a Standards template across all customer tenants and see per-tenant outcomes streaming in via SignalR within seconds.
+- The deprecation of CIPP BPA is non-disruptive: existing PSA / Hudu links continue to resolve in the rebuild's compatibility surface; standards run produces results equivalent to CIPP BPA on the same tenant.
+- A security researcher submits a report through the bug-bounty programme and receives a commercial-grade reward within the documented disclosure timeline.
+
+### 6.3 Operational outcomes
+
+- Region failover is exercised quarterly with a clean recovery.
+- A coordinated security response (e.g., a rotated cert, a flagged advisory) reaches the entire install base via a tagged image release within 24h.
+- The audit log answers "did a human or a robot do this?" for every customer-tenant mutation.
+- Operators have a single Hangfire dashboard plus a single OTel-fed observability surface and never need to ssh into a container.
+
+### 6.4 Strategic outcomes
+
+- The product is positioned as the credible commercial-grade evolution of the CIPP concept.
+- The Standards engine accumulates MSP-contributed handlers in a structured way (clean-room Pull Requests against a typed contract, not orphaned `.ps1` files).
+- The platform is a viable substrate for adjacent products (e.g., a customer-tenant compliance score, a per-MSP marketplace of certified Standards templates) without architectural rework.
+
+---
+
+## 7. Reading order for new joiners
+
+For someone joining the project for the first time, read in this order:
+
+1. **`README.md`** — what the project is and the target tech stack.
+2. **`REBUILD_PLAN.md`** (this file) — the strategic map across all the others.
+3. **`ARCHITECTURE.md`** — how the pieces fit together at runtime.
+4. **`PHASES.md`** — the phased build plan.
+5. **`CLAUDE.md`** — the coding standards (and the rules that govern AI-assisted work specifically).
+6. **`MEMORY.md`** — what was last touched, what's next.
+7. **`FEEDBACK.md`** — past corrections; do not repeat them.
+
+If a session is starting and someone has read only one document, read **`MEMORY.md`** first to catch up on state, then this document for context.
+
+---
+
+## 8. Update protocol
+
+This document is **append-only** within a phase: new findings become new sub-sections, old findings stand. If a strategic position changes, the old position is preserved (struck-through or marked "superseded YYYY-MM-DD") and the new position is added below, with an ADR recording the change. The doc's purpose is to be the canonical strategic narrative — losing the trail of how we got here makes the document useless.
+
+If the audit findings in §2 are revised (e.g., CIPP fixes one of them), the original finding stays with a "**Resolved upstream YYYY-MM-DD**" marker and a note. The rebuild's value-add is structural; one upstream fix doesn't invalidate the rebuild's premise, but the trail must be honest.
+
