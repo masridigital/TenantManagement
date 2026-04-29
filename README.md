@@ -1,50 +1,78 @@
-# TenantManagement Backend - Local Testing Guide
+# 🚀 TenantManagement - Local Testing Guide (For Dummies!)
 
-Welcome to the new Clean Architecture rebuild of the CIPP Tenant Management platform!
+Welcome to the new platform! We've made it **super easy** to run this project on your Mac. You do **NOT** need Docker, Postgres, or Redis installed. Everything runs entirely locally.
 
-To remove deployment friction, the Docker dependencies (PostgreSQL and Redis) have been completely removed for local development. The platform now seamlessly uses **SQLite** and **In-Memory Caching**.
+Follow these simple steps to see the backend in action.
 
-Follow these exact steps to run and test the backend features immediately.
+---
 
-## 1. Start the API (Terminal 1)
-The API project contains all of our MediatR logic, Minimal API endpoints, and EF Core contexts.
-Open a new terminal at the root of the repository and run:
+## 🛠 Step 1: Open Your Terminals
+We need to start two different pieces of software at the same time:
+1. **The API:** This handles web requests.
+2. **The Worker:** This runs background tasks (like syncing Microsoft Graph data).
+
+Because they need to run at the same time, we need **two separate terminal windows**.
+
+1. Open your Terminal app on your Mac.
+2. Press `Cmd + T` to open a second tab. Now you have two terminal windows/tabs ready!
+
+---
+
+## 🟢 Step 2: Start the API
+Go to your **first** terminal tab and copy/paste these exact commands:
+
 ```bash
-cd src/TenantManagement.Api
+# Go into the project folder
+cd "/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Api"
+
+# Start the API
 dotnet run
 ```
-*Wait until you see `Now listening on: http://localhost:5000` (or similar).*
 
-## 2. Start the Background Worker (Terminal 2)
-The Worker project runs our Hangfire background jobs which simulate pulling data from Microsoft Graph and caching it locally in the SQLite database.
-Open a **second** terminal at the root of the repository and run:
+**What to look for:** Wait a few seconds until you see a message that says `Now listening on: http://localhost:5000` (or a similar link). Leave this window open and running!
+
+---
+
+## ⚙️ Step 3: Start the Background Worker
+Go to your **second** terminal tab and copy/paste these exact commands:
+
 ```bash
-cd src/TenantManagement.Worker
+# Go into the worker folder
+cd "/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Worker"
+
+# Start the Worker
 dotnet run
 ```
-*Wait until you see `Hangfire Server started` and `Application started`.*
 
-## 3. Verify the Endpoints
-With both services running, you can test the APIs.
+**What to look for:** Wait a few seconds until you see messages saying `Hangfire Server started` and `Application started`. Leave this window open too!
 
-Because the system implements strict multi-tenant isolation, it requires an authenticated `MspId`. For local testing, we have implemented endpoints that you can call. If you hit the health endpoint, you'll see it is alive:
-- **Health Check:** `http://localhost:5000/api/health`
+---
 
-### Swagger / OpenAPI UI
-To easily interact with the authenticated endpoints, open your browser to:
-**[http://localhost:5000/swagger](http://localhost:5000/swagger)** *(Note: The port might be different depending on your launchSettings.json, check Terminal 1 output for the exact URL, e.g., `https://localhost:5001/openapi/v1.json`).*
+## 👀 Step 4: Look at the Local Database!
+We are using SQLite, which means the entire database is just a single file on your computer.
 
-*Currently available endpoints:*
-* `GET /api/tenants`
-* `GET /api/tenants/{customerTenantId}/users`
+1. Open Finder and go to:
+   `/Users/josephmasri/Library/CloudStorage/Egnyte-MasriDigital/Shared/Documents/AI Projects/SIPP/TenantManagement/src/TenantManagement.Api/`
+2. You will see a file named **`TenantManagement.db`**. That is your database!
+3. If you want to see the tables inside it, download a free app called **[DB Browser for SQLite](https://sqlitebrowser.org/)** or use the SQLite extension in VS Code. If you open that file, you will see the `CustomerTenants`, `TenantUsers`, and `TenantGroups` tables perfectly created!
 
-*(Note: Without a valid Bearer token from Azure AD, these endpoints will return a `401 Unauthorized`. To test these natively, you'll need to configure your `AzureAd` block in `appsettings.json` with a valid App Registration.)*
+---
 
-## 4. Explore the Database
-Because we use SQLite, a file named `TenantManagement.db` has been automatically created in the `src/TenantManagement.Api` folder.
-You can open this file using any SQLite viewer (like DBeaver, or the VSCode SQLite extension) to see the tables we created (`CustomerTenants`, `TenantUsers`, `TenantGroups`) and verify the data schema!
+## 🌐 Step 5: Test the API in your Browser
+Now that everything is running, let's make sure the API is alive.
 
-## What was built in this milestone?
-- **Phase 0:** Clean Architecture scaffolding, Domain Base Entities with strict Global Query Filters forcing `MspId` encapsulation.
-- **Phase 1:** Cache Hierarchy (L1: Memory, L2: Memory/Redis, L3: Database Projections) eliminating UI-blocking Graph calls.
-- **Phase 2:** Graph Tenant SDK Client factories and Background Hangfire sync jobs for Users, Groups, and Tenants.
+Open your favorite web browser (Chrome, Safari, etc.) and click this link:
+👉 **[http://localhost:5000/api/health](http://localhost:5000/api/health)**
+
+*(Note: If it doesn't load, look at your First Terminal tab. It will tell you exactly which port it is using, like `http://localhost:5001`. Use that number instead!)*
+
+If you see a blank page that says `{"status":"Healthy","timestamp":"..."}`, **congratulations!** The entire backend is running flawlessly on your machine. 🎉
+
+---
+
+## 🛑 How to Stop Everything
+When you are done testing, you need to turn the servers off.
+1. Go to your **first** terminal tab and press `Control + C` on your keyboard.
+2. Go to your **second** terminal tab and press `Control + C` on your keyboard.
+
+That's it! You've successfully run the new Tenant Management platform!
