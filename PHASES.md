@@ -242,3 +242,69 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **Polly pipeline mis-tuning.** Mitigation: rate-limit + bulkhead defaults are conservative; tune in Phase 11 from real telemetry; never tune by gut feel in dev.
 
 ---
+
+## Phase 3 — Caching and projections
+
+**Goal:** Prove the four-layer read path on **one resource** (users) end-to-end. Once this works, every subsequent domain just plugs in. This is the phase that lifts the rebuild's core value off the slide deck and into running code: a request thread that **never** paginates Graph.
+
+### Scope
+
+- L1: `IMemoryCache` registered with size-limit and a per-entry size estimator; default 5 min TTL; key prefix `l1:`.
+- L2: Redis distributed cache with `IDistributedCache` adapter; `IGraphCacheKey` factory enforcing the key conventions from `ARCHITECTURE.md` §3 including the `schema:v{rev}` segment.
+- L2 stampede protection: `SemaphoreSlim` per cache key for read-through population.
+- L3: `identity.users_projection` typed Postgres table with the projected user shape (object id, UPN, display name, mail, account enabled, manager id, license assignments by SKU id, last sign-in, source delta cursor id) plus the standard multi-tenant columns (`MspId`, `CustomerTenantId`, audit columns, `RowVersion`).
+- L3: `users_sync_state` row per `(MspId, CustomerTenantId)` carrying `last_full_sync_at`, `last_delta_sync_at`, `delta_cursor_state`, `last_error`.
+- The warmer job:
+  - `WarmUserListJob(MspId, CustomerTenantId)` fire-and-forget Hangfire job.
+  - First run: full page-iterated read using `PageIterator<User>`, project rows, set the cursor.
+  - Subsequent runs: delta read using `users.Delta()`, upsert/delete projection rows, update cursor.
+  - Idempotent: re-running is a no-op on unchanged data.
+- The orchestrator:
+  - Recurring Hangfire job `WarmMspUsersJob(MspId)` every 15 min that enumerates active customer tenants and enqueues per-tenant warm jobs subject to the per-MSP bulkhead.
+- The resolver:
+  - `IUserListResolver.GetAsync(mspId, customerTenantId, query, ct)` walks L1 → L2 → L3 → cold-fallback (one bounded Graph page + warmer kick) per `ARCHITECTURE.md` §3 step list.
+  - Returns the data with `last_synced_at` so the UI can render the "data refreshed N minutes ago" footer.
+- Write-path invalidation hooks: `IInvalidationPort.InvalidateUserList(mspId, customerTenantId)` and `InvalidateUser(mspId, customerTenantId, userObjectId)` callable from any future write handler.
+- Metrics: `cache_hit_total{layer,resource}`, `cache_miss_total`, `delta_sync_duration_ms`, `delta_failure_total`, `warmer_queue_depth`.
+- A purpose-built **load test** scenario: 50 simulated MSPs × 20 customer tenants each × a steady "list users" request load, asserting the read path stays under the latency budget without a single request thread paginating Graph.
+- A diagnostics endpoint `GET /api/_diagnostics/cache/{mspId}/{customerTenantId}/users` showing the L1/L2/L3 hit-or-miss decision and the staleness for the last N requests, gated to SuperAdmin.
+
+### Out of scope
+
+- Any other resource type (groups, devices, etc.) — those land in Phase 4 and 7. **Users** is the reference implementation; subsequent resources copy the pattern.
+- The user-facing UI (Phase 4 — this phase ships only the API and the warmer).
+- Write paths (Phase 4 — this phase ships only reads).
+- Projections for resources that don't support delta (Phase 7).
+
+### Entry criteria
+
+- Phase 2 exit criteria all green.
+- A test customer tenant with > 1,000 user records (so pagination and delta are exercised) and a script to mutate users on it for delta verification.
+
+### Exit criteria
+
+1. **Read path SLO**: under the load-test scenario above, p95 of `GET /api/identity/users?customerTenantId={id}` is ≤ 250 ms and p99 ≤ 600 ms over warm cache. Zero requests trigger a `nextLink` walk on the request thread (verified by absence of `cache_miss_total{layer="l3"}` plus `graph_request_total{caller="resolver"}` events for non-cold tenants).
+2. **Cold-tenant first read** (newly seeded `(MspId, CustomerTenantId)` with empty L3) returns ≤ 1 s, populates one Graph page synchronously, and enqueues the warmer; the second read from L3 within 10 s returns the full set.
+3. **Stale-but-not-cold**: forcing `last_synced_at` to 1 hour past the freshness window returns the stale data immediately, kicks the warmer, and the next read returns fresh data within the warmer's budget.
+4. **Delta correctness**: mutate 10 users on the test tenant, wait for the warmer cycle, observe the projection has applied exactly those changes (no stragglers, no extras).
+5. **Cursor reset**: forcibly invalidate the delta cursor, confirm the warmer falls back to full sync, the metric `delta_failure_total{reason="cursor_expired"}` increments, and the projection is reconciled.
+6. **Stampede protection**: 1,000 parallel cache misses for the same key produce exactly one underlying L3/Graph fetch.
+7. **Schema rev invalidation**: bumping the schema rev (a deploy-time constant) effectively expires all L1/L2 entries; verified by hit-rate dropping and immediately recovering as warm runs.
+8. **No request-time pagination test**: a CI integration test asserts `IGraphTenantClient` records zero Graph calls during 1,000 read requests against a warm tenant.
+9. Coverage `>= 80%` on the new resolver, warmer, and projection code.
+10. `MEMORY.md` updated; ADR-0004 records the cache hierarchy and freshness defaults.
+
+### Verification
+
+- The load test in point 1, run in CI nightly with results posted to the project log.
+- A recorded session showing the delta correctness check (point 4) end-to-end.
+- A negative test PR removing the `SemaphoreSlim` coalescing fails the stampede assertion.
+- A negative test PR that adds a `nextLink` walk on the request thread fails the assertion in point 8.
+
+### Risks
+
+- **Delta semantics edge cases.** Users that are deleted-then-recreated, or where Graph returns a row with only the `id` and the change reason, can confuse the projection. Mitigation: `IUserDeltaApplier` has an explicit unit-test matrix for every `@removed` shape Graph emits, and a fall-through to full-sync if a row is unparseable.
+- **Projection drift.** A bug in the upsert can let Graph and projection diverge silently. Mitigation: a low-frequency reconciler job that does a small random-sample full read against Graph and asserts equivalence; alarm if drift > 0.5%.
+- **Hot-key Redis pressure.** A few very large MSPs can put 80% of read traffic on a few keys. Mitigation: L1 absorbs the hot read; L2 keys carry compressed payloads; the per-MSP bulkhead caps ingest.
+
+---
