@@ -77,3 +77,42 @@ Operational secrets **never** appear in env vars, log lines, structured-log prop
 - We do **not** build a forked PowerShell runtime. The rebuild does not run any CIPP `.ps1` file in production. Migration tools may parse CIPP exports, but no execution.
 
 ---
+
+## 2. Bounded contexts
+
+The feature surface decomposes into **13 bounded contexts**, each with its own folder under `Application/` and `Domain/`, its own MediatR handlers, its own DTOs, its own background jobs, and (where the resource is large) its own L3 projection table set. A context owns its data; cross-context reads happen via **public DTOs**, never via reaching into another context's entities or its `DbContext`.
+
+The map below is the canonical list. Filenames inside each context follow the same pattern: `<Context>/<Aggregate>/<Action>/<ActionCommandOrQuery>.cs`.
+
+| # | Context | Owns | Primary upstream | L3 projection? | Notes |
+| - | ------- | ---- | ---------------- | -------------- | ----- |
+| 1 | **Identity** | Users, groups, devices, app registrations, GDAP/JIT, risky users, sign-in logs, breach search | Graph: `users`, `groups`, `devices`, `applications`, `directoryRoles`, `riskyUsers`, `signIns`, `auditLogs/directoryAudits`; HIBP for breach search | Yes (users, groups, devices) — delta-driven | Hosts the MSP-side identity (us → MSP) **and** the customer-side identity (MSP → customer tenant); these are different aggregates that happen to share Graph plumbing |
+| 2 | **EndpointManagement** (Intune) | Devices (managed), policies, autopilot, applications, assignment filters, compliance, BitLocker / LAPS recovery, scripts | Graph `deviceManagement/*`, `deviceAppManagement/*` | Yes (managed devices, policies, applications) | Recovery-key reads are a sensitivity hotspot — separate audit channel and just-in-time access |
+| 3 | **ExchangeOnline** | Mailboxes, mailbox permissions, mailbox rules, transport rules, connectors, anti-spam / phishing / malware filters, safe links / attachments, quarantine, message trace, mailbox restore | Graph `users/{id}/mailboxSettings`, `users/{id}/messages`; **Exchange Online PowerShell** for the bits Graph still doesn't cover | Partial — mailbox metadata only; message bodies are not stored | The PowerShell-only fallback is isolated in `TenantManagement.Graph.ExchangeShim` so the rest of the app stays Graph-typed |
+| 4 | **Collaboration** (Teams / SharePoint / OneDrive) | Sites, voice, activity, OneDrive provisioning, sharing settings | Graph `sites`, `teams`, `chats`; Teams admin endpoints | Yes (sites list per tenant) | Voice / LIS is a discrete sub-aggregate; can be feature-flagged off for MSPs without voice |
+| 5 | **Security** | Alerts, incidents, Defender state / TVM, secure score, BEC check & remediate, tenant allow/block lists, audit log search, named locations | Graph `security/*`, `auditLogs/auditLogQueries`, M365 Defender API | Yes (alerts, incidents, secure score history) | Audit-log search is a long-running query; modelled as a saga, not a request handler |
+| 6 | **Tenants** | Onboarding (GDAP invites, role mapping, SAM bootstrap), offboarding, alignment / drift, all-tenant BPA / compliance / domain health | Partner Center, Graph delegated relationships | Yes (the canonical customer-tenant table) | The platform's "spinal cord" — every other context reads from this for `(MspId, CustomerTenantId)` lookups |
+| 7 | **Standards** | The Standards engine: typed `IStandardHandler` registry, per-tenant settings, Report / Remediate / Alert modes, drift detection | All Graph endpoints (per-handler) | Yes (Standards reports, drift baselines blob refs) | One handler per standard — see `CLAUDE.md` §8 |
+| 8 | **Templates** | CA, Intune, transport rule, group, app, BPA, standards, spam / connection / safe-links, JIT | None — internal store | n/a (this **is** the canonical store) | Postgres `jsonb` column, no 64 KB limit; versioned with row-versioning |
+| 9 | **Reports** | Domain analyser, license usage, inactive accounts, MFA report, app consents, OAuth apps | Graph + DNS lookups | Yes (license usage history, inactive accounts) | Reports are a read-side projection; they never write to Graph |
+| 10 | **Automation** | Recurring jobs, webhooks, alert configurations, PSA integrations | Hangfire / Service Bus internally; PSA APIs externally | Partial (job history) | Hosts the scheduler. Per-integration adapters live in `TenantManagement.Integrations.<Provider>` |
+| 11 | **Bpa** (Best Practice Analyzer) | Legacy BPA support; one-way migration off to Standards | Same Graph endpoints as Standards | Read-through to Standards' projection | Exists for migration only — see §10 of `PHASES.md` |
+| 12 | **PlatformAdmin** | Backend health, MSP users & roles, partner webhooks, branding, integrations, app permissions, GDAP role mapping, custom data | None upstream; this is purely platform-side | n/a | The "settings" surface — administered by SuperAdmin |
+| 13 | **Observability** | Activity feed, audit trail, scheduled-item history, distributed-tracing surface | Internal + OTel exporter | Yes (audit log, activity feed) | This is a context, not just plumbing — it has a UI surface and a query model |
+
+### Cross-context rules
+
+- **No `using TenantManagement.Application.<OtherContext>.Entities`** — period. Cross-context reads go through DTOs published by the source context's `Application` project.
+- **Domain events** are how contexts react to each other. Example: `Tenants.OnboardingCompleted` → `Identity` warms the user / group projection; `Standards` schedules first ReportAsync; `Automation` enables default schedules.
+- **No shared DbContext.** Each context has its own `IModuleDbContext` partial, composed at startup into a single `AppDbContext`. Migrations are owned per-context.
+- **Cross-context queries that span 3+ contexts** (e.g., "show me every customer tenant where the secure-score handler last reported red AND there's a high-severity incident open AND BitLocker-recovery-key reads happened in the last 24h") go through a dedicated **read model** in the `Reports` context, not through ad-hoc joins.
+
+### Why 13, not 380
+
+CIPP-API exposes **~300 HTTP endpoints + ~80 background functions** with no controller registry. We collapse that to ~13 controller groups (one per context) hosting endpoint groups. The endpoint count drops by an order of magnitude not because we lose features but because:
+
+- One handler replaces many one-off `Invoke-*.ps1` files (e.g., one `UsersController` group, not 22 user-related `Invoke-*.ps1` files).
+- "Get a list" + "get one" + "delta since cursor" share one query handler with a parameter, not three files.
+- Sub-resources are URL nesting, not new top-level endpoints.
+
+---
