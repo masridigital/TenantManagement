@@ -628,3 +628,109 @@ Secrets **never** appear in:
 - ❌ `Console.WriteLine`-ing a token "to debug." There is no scenario in which this is acceptable.
 
 ---
+
+## 8. Background processing
+
+The rebuild has three classes of background work and **one** rule that holds across all of them: **every job is idempotent**. If a job cannot be made idempotent, it isn't ready for production.
+
+### The three classes
+
+| Class | Tech | Lifetime | Examples |
+| ----- | ---- | -------- | -------- |
+| **Recurring / cron** | **Hangfire** (Redis storage) | seconds–minutes per run, every N min/h/d | Per-tenant delta refreshers, token expiry sweeps, Standards reports, license sync, GDAP relationship refresh |
+| **Fan-out work queues** | **Azure Service Bus** (sessions for ordering when needed) | minutes–hours total | "Run Standard X across every tenant of MSP Y"; "Dispatch alert to all PSA integrations"; "Bulk user create across 1,000 rows" |
+| **Long-running orchestrations / sagas** | **Code-defined sagas** persisted to Postgres (no Durable Functions) | hours–days, surviving deploys | Tenant onboarding (GDAP invite → role mapping → SAM bootstrap → first standards run); audit-log searches; mass remediation runs with rollback paths |
+
+### Why Hangfire — and not the host's timer triggers
+
+- Real cron with `* * * * *` semantics, not "every N seconds" approximation.
+- Jobs survive restarts; Redis-backed persistence; built-in retry with exponential backoff and DLQ.
+- Per-job state visible in the Hangfire dashboard — operators can see what's running, what failed, and re-queue without a deploy.
+- One-shot fire-and-forget enqueues (`BackgroundJob.Enqueue<T>(j => j.Run(args))`) replace CIPP's Function host queue trigger ceremony.
+
+### Why Service Bus — and not Hangfire — for fan-out
+
+- Native session-based ordering when an MSP needs "process customers in this order" guarantees.
+- Per-subscription dead-letter queues with replay tooling.
+- Cross-cluster reliability: the orchestrator (the API node enqueuing work) and the workers (the worker nodes consuming) decouple cleanly; each scales on its own metric.
+- Backpressure: a slow consumer doesn't queue-overflow Hangfire's Redis.
+
+### Why sagas — and not Durable Functions
+
+CIPP's Durable Functions caused two distinct problems documented in their own README and FAQ:
+
+1. **Strict version matching.** Mid-deploy state nukes when the new code's orchestration version doesn't match the running one — leading to a user-facing "Clear Durable Queue" maintenance UI, which is the opposite of operational excellence.
+2. **Opaque state.** Recovering from a partially completed orchestration requires Function-host log spelunking; the state isn't queryable from the app.
+
+Our sagas are **code-defined** state machines persisted to a `Sagas` Postgres table:
+
+```sql
+CREATE TABLE Sagas (
+    SagaId UUID PRIMARY KEY,
+    MspId UUID NOT NULL,
+    SagaType TEXT NOT NULL,            -- 'TenantOnboarding', 'AuditLogSearch', ...
+    Version INT NOT NULL,              -- saga code version at last step
+    State JSONB NOT NULL,              -- typed via System.Text.Json
+    Status TEXT NOT NULL,              -- 'running' | 'awaiting' | 'completed' | 'failed'
+    AwaitingMessage TEXT NULL,         -- correlation id for the message we're waiting for
+    LastStepAt TIMESTAMPTZ NOT NULL,
+    NextWakeAt TIMESTAMPTZ NULL,
+    TraceId TEXT NOT NULL
+);
+```
+
+- Every step is **idempotent** and writes the next state in the same Postgres transaction as any side-effect tracking.
+- A deploy with a new saga version does **not** invalidate in-flight sagas. The handler resolves by `(SagaType, Version)`; old versions stay in the binary until their last in-flight saga completes (typically a few hours after rollout).
+- Resumption uses `SagaId` from a Service Bus message, a Hangfire timer wake-up, or a webhook callback. There is no "magic" replay.
+- Sagas are queryable: operators can `SELECT * FROM Sagas WHERE Status = 'awaiting' AND NextWakeAt < NOW() - INTERVAL '1 hour'` to find stuck flows.
+
+### The warmer scheduler
+
+The single most important background system is the per-tenant warmer. It exists to keep L3 fresh so request threads never paginate Graph (§3).
+
+```
+Hangfire recurring job: warm-msp-{mspId}     (every 1m)
+    → enumerate active tenants for the MSP
+    → for each tenant, check:
+        - L3.last_synced_at vs. resource freshness window
+        - GraphDeltaCursors row presence
+    → enqueue per-tenant per-resource warm jobs (Hangfire fire-and-forget)
+        - one job per (MspId, CustomerTenantId, ResourceType)
+        - bounded concurrency via the per-MSP bulkhead (§6 Polly pipeline)
+        - delta sync if cursor exists; full sync if not
+    → write last_synced_at on success in the same txn as projection upserts
+```
+
+- The per-tenant warm jobs are **stateless**. Re-running one is safe — the projection upsert is keyed on the entity's stable id and the cursor advances only on success.
+- Failure does **not** poison the queue. A failed warm logs, increments a metric, and the next scheduled run picks it up. Persistent failure (3 consecutive runs) raises an alert and pauses that resource for that tenant.
+- The cadence per resource is set in `WarmerSchedule` config (defaults in §3), per-MSP-overridable. Hot resources (users) refresh every 15 min; cold ones (license SKUs) every 24 h.
+
+### Fan-out: per-MSP bulkhead
+
+When an MSP runs "deploy Standard X across all 200 customer tenants":
+
+1. The API command enqueues **one** Service Bus message: `RunStandardCommand { MspId, StandardId, ScopeFilter }`.
+2. The orchestrator consumer fans out to per-tenant messages: `RunStandardOnTenantCommand { MspId, StandardId, CustomerTenantId }`.
+3. The per-tenant consumer respects:
+   - The per-MSP bulkhead (concurrency cap N).
+   - The per-customer-tenant rate limiter (Graph-friendly).
+   - Retry policy with DLQ on persistent failure.
+4. Progress is published via SignalR per-MSP group: `{ standardId, completed: K, total: N, failures: [...] }`.
+
+CIPP fan-out is bounded only by the Function host's auto-scaling, which means a single MSP can saturate it (a regression noted in Discussion `#4979`). Our bulkhead is per-MSP, so MSP A's Standards run cannot starve MSP B's UI.
+
+### Idempotency
+
+- **Cron jobs**: idempotent by construction — re-running the warmer is the design.
+- **Service Bus messages**: every message has a `MessageId`; consumers check an `IdempotencyKey` table before handling, write a row on success, and skip on duplicate.
+- **Sagas**: each step writes the next state in the same transaction as any side-effect record, so a step re-run is a no-op.
+- **Outbox pattern** for cross-bus invariants: when a command both writes to Postgres and emits a Service Bus message, the message is written to a `MessageOutbox` table in the same transaction; a relay sends it. No "I committed but the message vanished" race.
+
+### Anti-rules
+
+- ❌ "Run any handler by name from a queue payload" (CIPP's `& $cmdletName @args` pattern). Every handler is explicitly registered and its argument shape is typed.
+- ❌ Polling Graph from a request thread to fake real-time updates. Use SignalR; the warmer does the polling.
+- ❌ Sagas with mutable global state. State is the row; the row is the truth.
+- ❌ "We retry forever." DLQ exists for a reason; persistent failures escalate.
+
+---
