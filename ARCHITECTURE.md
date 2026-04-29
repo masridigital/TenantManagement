@@ -301,3 +301,91 @@ Compensating Graph deletes after a partial failure are explicitly rejected: they
 - **No write that bypasses the audit log.** If a code path doesn't write an audit row, it is not allowed to call Graph. This is enforced by the `IAuditingGraphInterceptor` registered on the SDK pipeline.
 
 ---
+
+## 5. Multi-MSP isolation
+
+This is a multi-tenant SaaS administering **other** multi-tenant systems. Two layers of tenancy stack:
+
+- **MSP tenant** — our customer (the MSP). Carried in the auth principal's `MspId` claim.
+- **Customer tenant** — the M365 tenant the MSP is acting on. Carried explicitly per request as `CustomerTenantId`, validated against the MSP's GDAP relationships before any Graph call.
+
+Cross-MSP data access must be **impossible by construction**, not "we remembered to add a where-clause." Five layers of defense.
+
+### Layer 1 — Auth (primary gate)
+
+- Sign-in is OIDC at the MSP's home tenant via `Microsoft.Identity.Web`.
+- The token's `tid` claim, mapped through `MspDirectoryLookup`, sets `MspContextAccessor.MspId` for the entire request scope.
+- Every endpoint has `.RequireAuthorization("<policy>")`. There is **no** default-allow path.
+- The platform-tenant (us) is its own MSP record; SuperAdmin operations require an explicit `MspId == PlatformMspId` policy.
+
+### Layer 2 — `MspContextAccessor` (DI-scoped, ambient)
+
+- A scoped service populated once per request from the auth principal.
+- Injected into `AppDbContext`, MediatR handlers, the Graph client factory, and Hangfire job activators.
+- **Never** mutable mid-request. There is no "switch MSP" within a request — that's a new request.
+- For background jobs, the job payload carries `MspId` and the Hangfire activator builds the scope around it.
+
+### Layer 3 — EF Core global query filters
+
+Every aggregate root has:
+
+```csharp
+modelBuilder.Entity<TEntity>().HasQueryFilter(e => e.MspId == _mspContext.MspId);
+```
+
+- Bypassing requires an explicit `IgnoreQueryFilters()` call. CodeQL / lint rule fails the build if `IgnoreQueryFilters` appears outside an allow-listed set of platform-admin queries.
+- `MspId` is a `NOT NULL` column on every multi-tenant table, with a CHECK constraint that it matches the row's parent.
+
+### Layer 4 — Customer-tenant authorization
+
+Customer-tenant access is **not** a claim. It is a runtime lookup:
+
+```csharp
+await _customerTenantAuth.AssertAccessAsync(mspId, customerTenantId, ct);
+```
+
+This service:
+
+1. Reads `MspCustomerTenantRelationship` (our store) to confirm the MSP onboarded the customer.
+2. Reads the cached GDAP relationship state (refreshed every 15 min by a background job) to confirm the relationship is still active.
+3. Logs the assertion to the audit log.
+4. Throws `CustomerTenantAccessDenied` (mapped to 403) if either check fails.
+
+It is called by:
+
+- The Graph client factory before issuing a token.
+- Every command handler before mutating projection rows for that customer tenant.
+- The SignalR hub on group join.
+
+### Layer 5 — Graph token scoping
+
+Each `IGraphTenantClient` is constructed for **one specific** `(MspId, CustomerTenantId)`. The token it carries:
+
+- Was acquired with that customer tenant's tenant-scoped refresh token (delegated GDAP) **or** the platform's confidential-client cert with the customer-tenant claim (app-only with GDAP scope).
+- Is cached under `tenant:{mspId}:{customerTenantId}:graph-token:{scope}`.
+- Cannot be reused for a different `(MspId, CustomerTenantId)` — the cache key wouldn't match and the SDK won't accept a token whose `tid` mismatches the call target.
+
+### Cross-MSP defenses summarised
+
+| Defense | What it stops | Where it lives |
+| ------- | ------------- | -------------- |
+| OIDC `tid` → `MspId` mapping | A user from MSP A signing in and seeing MSP B | `MspContextMiddleware` |
+| Endpoint policies | Unauthenticated traffic; insufficient role | ASP.NET Core authorization |
+| `MspContextAccessor` ambient | Code paths that "forgot" to filter | DI scope |
+| EF global filters | Hand-written queries missing the where-clause | `OnModelCreating` |
+| `IgnoreQueryFilters` lint rule | Unsanctioned filter bypass | CI: build failure |
+| `ICustomerTenantAuthorizationService` | Cross-customer-tenant access within an MSP | Per command + Graph client factory |
+| Token scoping | A leaked token serving a different tenant | Graph SDK + `IGraphTokenProvider` |
+
+Five layers, each independently sufficient to block cross-MSP access. None is the primary gate; all are enforced.
+
+### Platform-admin operations
+
+A small set of operations legitimately span MSPs (billing rollups, fleet health, incident response). These:
+
+- Run only under the `Platform.SuperAdmin` policy.
+- Use a dedicated `IPlatformAdminContext` that, when populated, allows `IgnoreQueryFilters()`.
+- Are **always audited** with `audit.scope = "cross-msp"` and `audit.justification` (a free-text reason captured at the UI).
+- Cannot read operational secrets — those are sealed even from SuperAdmin via Key Vault access policy and require a separate, ticketed break-glass flow.
+
+---
