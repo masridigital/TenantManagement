@@ -755,3 +755,77 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **Misuse of "generic" webhooks.** A loose schema is an injection vector. Mitigation: schema is enforced; payload is parsed into a typed envelope; downstream handlers receive only the typed shape, never a raw blob.
 
 ---
+
+## Phase 9 — Reports and analytics
+
+**Goal:** Cross-tenant rollups and read-side projections that answer the questions an MSP owner asks at the end of the month: "where is our license waste? who hasn't signed in? whose MFA is weak? what apps did users consent to that they shouldn't have? which domains are misconfigured?" These are **read-side** projections that never write to Graph, and which run against the L3 store + Graph on-demand for stuff that isn't projected.
+
+### Scope
+
+#### Reports surface
+
+- **Domain analyser** — per-tenant DNS / DKIM / SPF / DMARC / MX / MTA-STS / TLS-RPT state, with per-record explanation, mailbox-domain mismatch detection, and trend arrows over 90 days.
+- **License usage** — per-MSP / per-tenant SKU consumption vs. assigned, idle license detection, license cost mapping (with Pax8 sync from Phase 8 for true-up).
+- **Inactive accounts** — users with no sign-in in N days (configurable thresholds for licensed / unlicensed / shared mailboxes), guests dormant, accounts with passwords-never-expires.
+- **MFA report** — per-user MFA enrolment, methods registered, "registered but never used", per-tenant rollup.
+- **App consents** — per-tenant OAuth grant inventory, risk score (publisher / scope / user-or-admin consent), trend over time.
+- **OAuth apps** — apps approved or pending, scope-by-scope risk surface.
+- **Standards alignment** rollup — already shipped in Phase 6; this phase adds historical trend ("how did our alignment evolve over the last 6 months?").
+- **Drift** rollup — last-90-day drift events per tenant per category.
+- **Sign-in trends** — sign-in volume by tenant / location / risk level. (Doesn't store all sign-ins; aggregates daily into a `reports.signin_daily_aggregate` table.)
+- **Audit trends** — per-MSP audit-event volume by command type, week-over-week deltas.
+
+#### Read replica use
+
+- All long-running report queries hit the Postgres read replica (`Reports` context only) so they never perturb OLTP.
+- A "snapshot" feature: an MSP can run a report and the result is materialised into `reports.snapshots` for later compare or share, with a TTL.
+
+#### Export
+
+- Every report exports to CSV and to a paginated PDF for client-facing delivery.
+- Exports are generated server-side (off-thread Hangfire job), stored in Blob, and served via signed URLs that expire in 24 h.
+- PDF templating uses a typed model + handlebars; no untrusted templating.
+
+#### Scheduled reports
+
+- An MSP can schedule any report to run on a cron and deliver to an email distribution list, a Teams webhook, or a PSA ticket.
+- Scheduled report runs go through Phase 8's scheduler and Phase 8's outbound integrations.
+
+### Out of scope
+
+- BPA migration into Standards (Phase 10).
+- Per-MSP billing analytics for the platform itself (Phase 12).
+- A "build your own report" SQL surface — explicitly **not** in scope; the predefined reports plus scheduled exports cover the use cases CIPP customers actually use.
+
+### Entry criteria
+
+- Phase 8 exit criteria all green.
+- Read replica configured and running with measurable replication lag (< 1 s p95 in staging).
+- Pax8 sync (or equivalent) populating license cost mappings for the test MSPs.
+
+### Exit criteria
+
+1. Each report renders for a 200-tenant MSP in ≤ 3 s p95 from the read replica.
+2. Domain analyser flags a deliberately-misconfigured DKIM record on the test tenant within one warmer cycle and shows a remediation hint.
+3. License usage matches Pax8 truth ± 1 license per tenant (Pax8 has occasional eventual consistency).
+4. Inactive-accounts thresholds are persisted per-MSP and survive a deploy.
+5. MFA report's "registered but never used" classification is verified against a stub state matrix.
+6. App-consents risk score follows a documented rubric (`docs/reports/app-consent-risk.md`); changes to the rubric require a `FEEDBACK.md` entry.
+7. CSV and PDF exports for every report; signed URLs expire correctly.
+8. Scheduled report delivery via the three channels (email, Teams, PSA) succeeds end-to-end.
+9. Coverage `>= 80%` on `Application/Reports/*`.
+10. `MEMORY.md` updated.
+
+### Verification
+
+- A "month-end" recorded run by a stand-in MSP user generating all reports and one PDF export; total wall-clock ≤ 30 min for a 200-tenant MSP.
+- A delivery test: a scheduled report is delivered to an inbox + a Teams channel + a PSA ticket within budget.
+- The replication-lag dashboard during peak load stays under 1 s p95.
+
+### Risks
+
+- **Replica lag** under heavy ingest. Mitigation: lag SLO is a release gate; long-running queries that find lag > 5 s fall back to the primary with a warning footer.
+- **PDF generation memory.** Some reports for large MSPs are big. Mitigation: streaming PDF generation; Hangfire job has a memory budget; over-budget jobs split the report into per-tenant pages.
+- **App-consent risk subjectivity.** The score is a heuristic and can be wrong. Mitigation: the rubric is published; the score is editable by the MSP per app; overrides are versioned.
+
+---
