@@ -855,3 +855,212 @@ Default to typed columns. Use `jsonb` only when **the shape is genuinely free-fo
 - ❌ One row per "every K-V config item" anti-pattern (e.g., a `Settings` table with `key, value` columns). Use a typed config row per concept.
 
 ---
+
+## 10. Real-time push (SignalR)
+
+CIPP polls. A page that "watches" a long-running operation re-fetches every N seconds, paying the Function-App cold-start tax over and over. The rebuild's UI is **push-driven** for every state that changes asynchronously.
+
+### Hubs (one per domain)
+
+```
+/hubs/identity        — user/group/device CRUD progress; bulk results
+/hubs/scheduler       — Hangfire job state, fan-out progress, saga events
+/hubs/standards       — per-tenant standard run progress and drift events
+/hubs/security        — alerts, incidents, secure-score deltas
+/hubs/onboarding      — tenant onboarding saga step-by-step
+```
+
+Each hub:
+
+- Authenticates via the auth cookie (BFF, no token in browser).
+- Resolves `MspId` from the principal; the connection is bound to that MSP.
+- Joins per-MSP groups (`msp:{mspId}`) and per-customer-tenant groups (`msp:{mspId}:tenant:{cTenantId}`) on demand from the client.
+- Backend publishes via `IHubContext<TheHub>.Clients.Group(...)`; backplane is Redis.
+
+### What goes over SignalR — and what doesn't
+
+| Goes over SignalR | Stays out of SignalR |
+| ----------------- | -------------------- |
+| "Bulk add user 47/200 succeeded" | The full user list — that's an L2/L3 read after invalidation |
+| "Standard X completed on tenant Foo with 3 drift items" | The per-tenant drift detail — fetch on click |
+| "Saga 'TenantOnboarding-{id}' moved to step 'GdapInvited'" | Saga internal state — fetch on the saga details page |
+| "New high-severity alert for tenant Bar" | The alert body — fetch on click |
+| Ephemeral toast notifications | Anything that needs to be reliably delivered (use Service Bus + the audit log) |
+
+SignalR is **best-effort, low-latency, ephemeral**. If a client missed a message because it disconnected, the next page load reads from L2/L3 — which is now correct because the write path invalidated cache before publishing.
+
+### Backpressure
+
+A noisy operation does not produce one SignalR message per Graph response. Producers throttle: at most 1 update per group per 200ms, debounced.
+
+---
+
+## 11. Observability
+
+Three pillars (logs, metrics, traces) via OpenTelemetry, exported to Application Insights in Azure or Grafana Cloud for self-host.
+
+### Logs
+
+- `ILogger<T>` with **structured logging only**.
+- Event ids in per-area static classes (e.g., `LogEvents.Identity.UserCreated = new EventId(1001, "UserCreated")`).
+- Standard properties on every log: `MspId`, `CustomerTenantId` (when applicable), `TraceId`, `SpanId`, `EndpointName`.
+- PII redaction by `IPiiRedactor` middleware on the structured log enricher — emails, phone numbers, sign-in identifiers are partial-masked.
+- Secrets, tokens, and full request bodies of write operations are **never** logged.
+
+### Metrics
+
+Standard set captured per request and per background job:
+
+| Metric | Type | Tags |
+| ------ | ---- | ---- |
+| `graph_request_duration_ms` | histogram | `customer.tenant.id`, `endpoint`, `status_code`, `retry.count` |
+| `graph_request_total` | counter | same |
+| `graph_throttle_total` | counter | `customer.tenant.id` |
+| `cache_hit_total` | counter | `layer` (l1/l2/l3), `resource` |
+| `cache_miss_total` | counter | same |
+| `delta_sync_duration_ms` | histogram | `resource`, `customer.tenant.id` |
+| `delta_failure_total` | counter | `resource`, `failure_reason` |
+| `saga_step_duration_ms` | histogram | `saga_type`, `step` |
+| `signalr_publish_total` | counter | `hub`, `group` |
+| `auth_denial_total` | counter | `policy`, `reason` |
+
+SLIs derived from these: graph p95 latency, cache hit ratio per resource, delta failure rate, write-path p95 (audit-ack to projection-ack).
+
+### Traces
+
+- Every HTTP request gets a `TraceId` propagated through Service Bus messages, Hangfire jobs, and SignalR publishes.
+- Every Graph call emits a span with `customer.tenant.id`, `graph.endpoint`, `http.status_code`, `retry.count` attributes.
+- Saga steps emit child spans linked by saga id.
+- Sampling: 100% of error traces, 10% of success (configurable per environment).
+
+### Audit log
+
+Audit is **not** logging. It's a first-class, queryable, retained data class:
+
+- Every command and Graph mutation writes an audit row in the same Postgres transaction as the projection write.
+- Schema: `(MspId, CustomerTenantId, ActorPrincipal, ActorType, Command, TargetType, TargetId, Outcome, Status, Payload, TraceId, AtUtc)`.
+- 7-year retention with monthly partition archival to Blob.
+- Cross-MSP read access requires SuperAdmin + ticket id.
+
+### Health endpoints
+
+- `/health/live` — process liveness; never depends on downstream.
+- `/health/ready` — readiness; checks Postgres, Redis, and the ability to acquire a token from the cached cred. Hard-fails if any are out.
+- `/health/startup` — startup-only check used by the orchestrator to gate traffic until migrations and warm-cache are baseline.
+
+---
+
+## 12. Deployment topology
+
+### Environments
+
+| Environment | Purpose | Data |
+| ----------- | ------- | ---- |
+| **dev** | Per-engineer; Docker Compose locally | Synthetic |
+| **ci** | PR validation; Testcontainers per test class | Per-run scratch |
+| **staging** | Pre-prod soak; mirrors prod infra at 1/4 scale | Anonymised prod snapshot weekly |
+| **prod** | Customer traffic | Real |
+
+### Topology (Azure-first; portable to any cloud running Container Apps / EKS / GKE)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Azure Front Door (WAF, TLS, geo-routing, caching of static)     │
+└─────────────────────────────────────────────────────────────────┘
+                  │
+   ┌──────────────┴──────────────┐
+   │                             │
+┌─────────────────┐         ┌─────────────────┐
+│ Container Apps  │         │ Container Apps  │
+│ Web (Blazor)    │         │ Worker (HF/SB)  │
+│ — autoscale on  │         │ — autoscale on  │
+│   HTTP RPS      │         │   queue depth   │
+└─────────────────┘         └─────────────────┘
+   │                             │
+   └──────────────┬──────────────┘
+                  │
+   ┌──────────────┼─────────────────┬─────────────────┐
+   │              │                 │                 │
+┌──────────┐ ┌──────────┐    ┌──────────────┐  ┌────────────┐
+│ Postgres │ │ Redis    │    │ Service Bus  │  │ Key Vault  │
+│ Flex Srv │ │ Premium  │    │ Premium      │  │            │
+│ + replica│ │ (HA)     │    │ (sessions)   │  │            │
+└──────────┘ └──────────┘    └──────────────┘  └────────────┘
+   │              │                 │
+   └──────────────┴─────────────────┴────► OpenTelemetry → App Insights
+```
+
+### Single deployable shape
+
+The codebase produces three container images from one solution:
+
+1. **Web** — ASP.NET Core API + Blazor Web App.
+2. **Worker** — Hangfire host + Service Bus consumers.
+3. **Migrator** — short-lived; runs migrations against the target Postgres in CI.
+
+The Web and Worker images can be merged into a single deployable for self-host where simpler ops outweigh independent scaling.
+
+### Blue-green rollout
+
+- Container Apps revisions: traffic split 100/0 → 50/50 → 0/100 over a soak window.
+- DB migrations run as a CI step before the rollout (§9).
+- SignalR connections drain on the old revision; new connections land on the new one.
+- Hangfire honors a cooperative shutdown signal; in-flight jobs finish before the old container exits.
+
+### Self-host
+
+A `docker-compose.yml` produces the same topology with single-instance Postgres / Redis / Azurite (or RabbitMQ as a Service Bus stand-in). The same migrator image runs migrations; the same Web and Worker images run the app. Self-host MSPs pull tagged releases; there is no fork.
+
+---
+
+## 13. Failure modes and recovery
+
+The point of cataloguing failure modes is to make them **bounded** — small blast radius, clear recovery, no surprise at 3am.
+
+| Failure | Detection | Bounded blast radius | Recovery |
+| ------- | --------- | -------------------- | -------- |
+| Graph throttling for one customer tenant | 429 metric breach | That tenant's writes pause; reads serve from L3 | Polly retries with `Retry-After`; circuit breaker trips if persistent |
+| Graph endpoint regional outage | 5xx surge across many tenants | All Graph traffic in that region degrades | Reads serve stale L3 with banner; writes fail fast with retry-after; SLO violation alarms; nothing local to roll back |
+| Postgres primary loss | Health endpoint failure | Writes pause; reads continue from replica (read-only banner) | Failover to replica; promote; resume |
+| Redis loss | L2 unreachable | L1 hit ratio increases; L3 reads grow; latency rises by ~10ms | Reconnect; warm by traffic; **no data loss** (Redis is cache + ephemeral state) |
+| Service Bus loss | Outbox queue grows | Fan-out work pauses; UI commands return 202 with delayed processing | Reconnect; outbox relay drains; sagas resume |
+| Hangfire scheduler crash | Job heartbeat metric | Recurring jobs delayed by N seconds | Hangfire restart on the worker; jobs resume from Redis state |
+| One worker node crash | Container Apps health | That node's in-flight work is requeued | Container Apps restarts the revision; sagas resume |
+| Refresh-token leak (operational secret) | Anomalous Graph 401s + access-pattern alert | One MSP impacted | Rotate via `IRefreshTokenStore.RevokeAll(mspId)`; force re-consent; audit-log forensics |
+| DataProtection key compromise | Out-of-band signal | Refresh tokens become un-decryptable | Rotate to new key version; force re-consent across all MSPs; old ciphertext is dead-on-arrival |
+| Cache poisoning (bad delta) | Drift between L3 and Graph spot-check | One resource type for one tenant stale | Cursor reset → full sync; metric records the failure |
+| Mass Standards remediation gone wrong | User-initiated alarm or per-saga audit | Bounded by saga's compensation policy | Saga compensation steps; if compensation isn't safe, halt and alert |
+| Bad deploy | Health check or error rate | Traffic stays on old revision | Container Apps revision rollback (1 click) |
+| Schema migration that can't roll back | CI gate before deploy | Doesn't reach prod | Migration pipeline blocks |
+
+### Disaster recovery
+
+- Postgres point-in-time restore retained 35 days.
+- Blob (audit archive, drift baselines) geo-redundant.
+- Redis is **disposable** by design.
+- Recovery objectives:
+  - **RPO** (data loss tolerance): 5 min for Postgres, 0 for Blob, ∞ for Redis (we re-warm).
+  - **RTO** (time to restore): 30 min for primary outage to a fresh region.
+
+### What is explicitly not solved here
+
+- A user-initiated "Clear Durable Queue" UI (CIPP has one). The rebuild does not have the failure mode that requires it; sagas are queryable and resumable.
+- A "Forget my fork; pull upstream" workflow. The rebuild is single-source; there are no forks to reconcile.
+- A "PowerShell module out-of-date" warning. There is no PowerShell module.
+
+---
+
+## 14. The architecture in one paragraph
+
+A multi-tenant ASP.NET Core 10 backend administering customer M365 tenants on behalf of MSPs, using `Microsoft.Graph` v5 + `Microsoft.Identity.Web` for everything those libraries already do, with a real four-layer cache (L1 IMemoryCache → L2 Redis → L3 Postgres projections refreshed by background delta workers → bounded fallback to Graph), a typed write path that audits before Graph and updates the projection in the same Postgres transaction as the audit-status flip, multi-MSP isolation enforced in five independent layers, secrets in Key Vault and DataProtection-encrypted Postgres rows (never env vars), Hangfire + Service Bus for background work with code-defined sagas surviving deploys, SignalR for push, OpenTelemetry for observability, and Container Apps blue-green for deployment. The product's value-add is **caching, multi-tenant orchestration, the Standards engine, the UX, and the security posture** — not Graph proxying.
+
+---
+
+## 15. Document conventions
+
+- Section numbers are stable; **append, do not renumber**. New material lands at the next index.
+- Cross-references are by section number (e.g., "see §3" or "see §6 Polly pipeline").
+- Diagrams are ASCII for source-control friendliness; an SVG export lives in `docs/architecture/` if a richer view is needed.
+- This document is **non-normative for code**; `CLAUDE.md` is. If the two disagree, `CLAUDE.md` wins for code, and a `FEEDBACK.md` entry is required to reconcile.
+
+
