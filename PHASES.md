@@ -174,3 +174,71 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **OIDC consent UX.** First sign-in for an MSP requires admin consent. Mitigation: a dedicated "first-time setup" page that walks the admin through, with an explicit error path for "user is not a tenant admin."
 
 ---
+
+## Phase 2 — Graph integration core
+
+**Goal:** A typed `IGraphTenantClient` that any application code can inject, call any Graph endpoint through, and trust to be throttled, retried, batched, audited, and tenant-scoped — without that code knowing how any of those work. The integration leans on `Microsoft.Graph` v5 and `Microsoft.Identity.Web` for everything those libraries do; we own the factory and the resilience pipeline, **not** the SDK.
+
+### Scope
+
+- `IGraphTenantClientFactory` constructing per-`(MspId, CustomerTenantId)` instances of `IGraphTenantClient`.
+- `IGraphTokenProvider` with:
+  - OBO path (`AcquireTokenOnBehalfOfAsync`) used when `MspContextAccessor` carries a user principal.
+  - Client-credentials path (cert from Key Vault) used in worker contexts (no user).
+  - Distributed token cache (Redis-backed `IDistributedCache`) keyed by `(MspId, CustomerTenantId, Scope, [UserObjectId])`.
+  - `SemaphoreSlim` coalescing on cache miss so N concurrent acquisitions become 1 STS call.
+- Polly v8 pipeline registered on the SDK's `HttpClient` (`DelegatingHandler`):
+  - Bulkhead per `MspId` (default 64 concurrent in-flight).
+  - Per-`(MspId, CustomerTenantId)` token-bucket rate limiter (Redis-backed).
+  - Retry on 429 honouring `Retry-After` (cap 60 s, max 5 attempts).
+  - Retry on transient 5xx with jittered exponential backoff.
+  - Per-attempt 30 s timeout.
+  - Circuit breaker per `(MspId, CustomerTenantId)`.
+- `IGraphTenantClient.SendBatchAsync(BatchRequestContent, ct)` that succeeds **only if every subresponse is 2xx**; un-acked subrequests requeue into a follow-up batch with their inner `Retry-After` honoured.
+- `GraphAuditingHandler` middleware recording every Graph call (endpoint, method, status, retry count, latency) into `observability.audit_log` with `actor` resolved from the calling context.
+- `GraphDeltaCursors` table created with `(MspId, CustomerTenantId, ResourceType, DeltaLink, LastSyncedAt)` and a typed `IGraphDeltaCursorStore` over it.
+- A reference call site exercising the SDK: `Worker.Diagnostics.PingTenantAsync(mspId, customerTenantId)` reads `organization` and writes a single audit row. Used in the readiness probe and in dev for end-to-end verification.
+- GDAP relationship synchronisation against Partner Center, populating `MspCustomerTenantRelationship` (the table seeded in Phase 1). This is what plugs the real data into `ICustomerTenantAuthorizationService`.
+- Adding `customer.tenant.id`, `graph.endpoint`, `http.status_code`, `retry.count` to OpenTelemetry spans on every Graph call.
+
+### Out of scope
+
+- Any L1/L2/L3 caching of Graph **responses** (Phase 3 — this phase is the SDK + token + pipeline layer; data caching is the next layer up).
+- Any end-user UI consuming Graph (Phase 4+).
+- The Exchange / legacy-REST shims (Phase 7 — they'll plug in via the same Polly pipeline).
+- Standards run logic (Phase 6).
+- The "all customer tenants" cross-tenant grids (Phase 5).
+
+### Entry criteria
+
+- Phase 1 exit criteria all green.
+- A test customer M365 tenant with a GDAP relationship to the test MSP.
+- The platform's confidential-client cert provisioned in Key Vault and consented by the test MSP.
+
+### Exit criteria
+
+1. `Worker.Diagnostics.PingTenantAsync` succeeds against the test customer tenant from a worker pod, in a Hangfire-triggered job, and writes one audit row.
+2. The same call from the API context (under an MSP user's OBO token) also succeeds and audits with `actor = <user>`.
+3. A deliberately throttled tenant (forced 429 via a test stub) shows: retries up to 5, `Retry-After` honoured, telemetry tags set, no exception leaking past the Polly pipeline within budget.
+4. A batch of 10 mixed sub-requests with 2 forced 429s shows: outer 200, inner 429s captured, the two failing sub-requests requeued, eventual full success, audit row reflects the actual outcome.
+5. The token cache is verified: 100 concurrent calls for the same `(MspId, CustomerTenantId)` produce exactly **one** STS call (metric `auth_token_fetch_total`).
+6. `GraphDeltaCursors` round-trips a delta link for the `users` resource against the test tenant: first call full, second call returns empty changeset.
+7. `MspCustomerTenantRelationship` is populated by a Hangfire job from Partner Center; `ICustomerTenantAuthorizationService` now denies for relationships not present and grants for those that are; both outcomes audit.
+8. The `IGraphTenantClient` factory **refuses** to construct an instance for a `(MspId, CustomerTenantId)` not in `MspCustomerTenantRelationship`; this is the last line of defense before Graph.
+9. Coverage `>= 80%` on `TenantManagement.Graph` and the touched parts of `Infrastructure`.
+10. `MEMORY.md` updated.
+
+### Verification
+
+- Recorded chaos run: introduce 30 s of forced 429s mid-call from a stub, observe retries and final success in the audit log.
+- Token cache stampede test: 1,000 parallel `Worker.Diagnostics.PingTenantAsync` calls; assert exactly one STS round-trip.
+- Cross-tenant safety test: a fabricated request to construct `IGraphTenantClient(mspId=A, customerTenantId=Bs)` (B's tenant under A's MSP context, where the relationship doesn't exist) throws `CustomerTenantAccessDenied` before any token is acquired.
+- ADR-0003 records the choice to put the resilience pipeline on the SDK's `HttpClient` rather than wrapping individual SDK methods, with the rationale that the SDK is the abstraction and we don't re-abstract.
+
+### Risks
+
+- **Partner Center API quirks** (lower throughput, eventual consistency on relationship state). Mitigation: synchronisation is a Hangfire recurring job, not a request-time check; freshness window 15 min; relationships in flux are explicitly tracked.
+- **Token cache cold-start** under deploy. Mitigation: cache key version segment (§3 of `ARCHITECTURE.md`) so stale entries from previous deploys don't poison; warm-up calls on a small set of tenants in the readiness probe.
+- **Polly pipeline mis-tuning.** Mitigation: rate-limit + bulkhead defaults are conservative; tune in Phase 11 from real telemetry; never tune by gut feel in dev.
+
+---
