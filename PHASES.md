@@ -498,3 +498,93 @@ Total: ≈ 48 engineering weeks elapsed (assumes 3-engineer team). Calendar runt
 - **JIT elevation as a privilege-escalation path.** Mitigation: every elevation requires a justification, is rate-limited per MSP user, and triggers an immediate audit notification to the MSP's SuperAdmin.
 
 ---
+
+## Phase 6 — Standards engine
+
+**Goal:** A typed, registry-driven Standards engine that replaces CIPP's 187 bespoke PowerShell standard files with type-checked C# handlers, where every standard is independently testable, every handler implements three modes (Report / Remediate / Alert), drift is detected via a JSON-Patch diff against a stored baseline, and templates live in Postgres `jsonb` (not 64 KB-capped Azure Tables). This phase is the single biggest functional differentiator between the rebuild and CIPP.
+
+### Scope
+
+#### Engine
+
+- `IStandardHandler` interface with `ReportAsync(StandardContext)`, `RemediateAsync(StandardContext)`, `AlertAsync(StandardContext)`.
+- `[Standard("AntiPhishingPolicy", Category = StandardCategory.Email)]` attribute + assembly-scanning registration into `IStandardRegistry`.
+- `StandardContext`: `(MspId, CustomerTenantId, IGraphTenantClient, settings: T, mode, traceId, ct)`.
+- Per-standard typed settings: `record AntiPhishingPolicySettings(bool EnableImpersonationProtection, ...)` deserialised from the template payload.
+- Mode invariant: `RemediateAsync` cannot run unless a `ReportAsync` for the same `(MspId, CustomerTenantId, StandardId, runId)` is on file with `outcome != "skipped-due-to-error"`. Enforced in the orchestrator, not in each handler.
+- Idempotency: Remediate observes the post-Report state and applies only the necessary delta; re-running is a no-op.
+
+#### Drift
+
+- After `ReportAsync` runs, the typed result is canonicalised and diffed against `standards.drift_baselines` (per `(MspId, CustomerTenantId, StandardId)`).
+- Diff format: JSON Patch (RFC 6902).
+- Drift events surface in:
+  - The all-tenants drift grid (Phase 5 frame).
+  - The per-tenant standards page.
+  - SignalR (`/hubs/standards`) so open dashboards update live.
+- Baselines are blob-stored when large; the Postgres row carries metadata + blob ref.
+
+#### Templates
+
+- `templates.standards_templates` typed table with `(MspId, TemplateId, StandardId, Settings jsonb, Version, IsDeleted, RowVersion)`.
+- A template is a named bundle of per-standard settings. MSPs apply a template to a tenant or a tenant group.
+- Versioning: editing a template creates a new version; old versions stay so audit history can resolve "what version was applied when".
+- Import path: a CIPP standards template export can be parsed and converted to the new shape (best-effort; conversion notes shown in the UI).
+- Other template kinds in scope this phase: CA templates, group templates, JIT admin templates. Intune / spam / connection / safe-links templates roll into Phase 7 with their respective domains.
+
+#### Orchestration
+
+- `RunStandardsCommand(MspId, ScopeFilter, Mode, TemplateId)` — fans out via Service Bus to per-tenant `RunStandardOnTenantCommand` subject to the per-MSP bulkhead.
+- Saga-tracked for any run > 100 tenants (i.e., an MSP-wide standards run is a saga).
+- Progress published via SignalR per-MSP and per-tenant groups.
+- A run row in `standards.standard_runs` aggregates per-tenant outcomes; an audit row records the initiating user.
+
+#### UI
+
+- All-tenants alignment grid (data plug-in to the Phase 5 frame).
+- Per-tenant Standards page: list of applicable standards, each with mode (Report / Remediate / Alert), last result, drift status, "run now" affordance.
+- Per-standard detail page: typed settings editor (a generated form bound to the settings record), per-tenant override view, run history.
+- Template editor: list / create / edit / version-diff / apply-to-scope.
+- A "what would this do?" preview that runs the standard in **dry-run** mode (Report against current state, simulate Remediate without writing) and shows the planned diff.
+
+#### Migration tooling
+
+- A script in `TenantManagement.Migrations` that reads a directory of CIPP `Invoke-CIPPStandard*.ps1` files, parses metadata (name, category, default settings), and produces a stub C# handler skeleton with TODOs for the actual Graph calls. **Does not execute PowerShell.** It's a code-generation aid for clean-room reimplementation.
+
+### Out of scope
+
+- Domain-specific standards whose content lives in Phase 7 (e.g., Defender posture, Intune compliance specifics) — those handlers can be authored in Phase 7. Phase 6 ships the engine plus a representative ≥ 30 standards covering the most-used CIPP categories (Identity, Email, Tenant, AAD).
+- BPA migration into Standards (Phase 10).
+- Scheduler UI (Phase 8) — for now, runs are kicked off ad-hoc or on a default per-MSP cron.
+
+### Entry criteria
+
+- Phase 5 exit criteria all green.
+- A representative customer tenant with a "messy" baseline (some non-default settings, some legacy policies) so drift detection has signal.
+
+### Exit criteria
+
+1. ≥ 30 standards implemented in C# across Identity / Email / Tenant / AAD categories, each with all three modes.
+2. Each handler has unit tests covering: report against a stub Graph state, remediate against a delta, idempotency on re-run.
+3. Mode invariant verified: a remediate-without-report attempt fails fast with a typed error (proven by a negative test).
+4. Drift baselines round-trip a JSON Patch correctly; a deliberately-introduced setting change is detected and surfaced in the drift grid in ≤ 1 warmer cycle.
+5. Run a template against 50 tenants, observe per-MSP bulkhead caps the concurrency, every per-tenant outcome lands in the run row, no Graph throttle errors leak past the pipeline.
+6. Mid-run worker restart resumes the saga; outcomes are not duplicated; idempotency keys hold.
+7. Template import from a real CIPP standards export produces a structurally valid new template (with conversion notes for any settings the new shape doesn't yet support).
+8. The dry-run preview produces a diff identical to the actual remediate would produce, against an unchanged tenant.
+9. Coverage `>= 80%` on `Application/Standards/*`, `Domain/Standards/*`, and the per-handler standards code.
+10. `MEMORY.md` updated; ADR-0005 records the engine design and the JSON-Patch baseline format.
+
+### Verification
+
+- A side-by-side recorded comparison of running 5 representative standards in CIPP and in the rebuild against the same tenant; outcomes equivalent, runtime in the rebuild ≤ 1/3 of CIPP's.
+- A drift-detection demo: change a setting out-of-band, observe the next run flag it, the all-tenants grid update, the SignalR push.
+- A negative test PR that authors a handler missing one of the three modes fails the registry-validation step at startup (or a CI test).
+
+### Risks
+
+- **Per-handler scope creep.** A handler that "just one little time" reads or writes outside its declared scope is a recipe for drift between Report and Remediate. Mitigation: each handler declares its read/write scope in metadata; the engine validates at runtime; CI test fails on undeclared calls.
+- **Template-shape evolution.** A schema change to a settings record breaks existing templates. Mitigation: versioned settings records with explicit migration functions; the template version pins the schema version; no in-place edits to a published settings shape.
+- **Drift noise.** Microsoft pushes settings shapes around (new properties, defaults change). Mitigation: a per-property "ignore if unset" flag in the standard's metadata; baselines store both the recorded shape and the schema version.
+
+---
