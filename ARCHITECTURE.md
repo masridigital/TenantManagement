@@ -222,3 +222,82 @@ Keys are constructed by `IGraphCacheKey` factory methods, never concatenated by 
 This single rule eliminates the largest class of CIPP's user-facing performance complaints.
 
 ---
+
+## 4. The write path
+
+Where the read path optimises for "the request thread never paginates Graph", the write path optimises for "the cache never disagrees with reality for longer than one user-perceptible tick".
+
+### The five steps
+
+A command (`CreateUserCommand`, `EditCaPolicyCommand`, `RemediateStandardCommand`, etc.) executes in this order:
+
+```
+1. AUTHORIZE            → policy + ICustomerTenantAuthorizationService.AssertAccess(...)
+                          (denials are audited as signal, not noise)
+
+2. WRITE-AHEAD AUDIT    → record { actor, msp, customerTenant, command, payload-hash, traceId, "pending" }
+                          in a SINGLE Postgres transaction with the next step
+
+3. CALL GRAPH           → IGraphTenantClient.<Action>(...)
+                          ▸ Polly v8 pipeline (throttle / retry / bulkhead)
+                          ▸ batch when the command writes >1 entity
+                          ▸ inspect every batch subresponse (no silent inner 429s)
+
+4. UPDATE PROJECTION    → in the SAME Postgres transaction as the audit-log row's
+                          status flip ("pending" → "succeeded"), upsert the
+                          authoritative shape returned by Graph into the L3 table.
+                          This is the canonical post-write state — not the request
+                          DTO, not what the client sent.
+
+5. INVALIDATE + NOTIFY  → del L2 keys for the affected lists/entities; publish a
+                          SignalR message on the per-MSP/per-tenant group so all
+                          connected clients refresh L1 and update their grids.
+```
+
+### Why this exact order
+
+- **Audit before Graph.** If the process dies between the Graph call and the projection update, the audit log already shows "pending"; a reconciler resumes from there. CIPP loses operations that crashed mid-write because there was no pre-call durable record.
+- **Projection update in the same Postgres transaction as the audit-log status flip.** If the projection update fails (e.g., a constraint violation we didn't catch in validation), the audit row stays "pending" and a metric increments. We **never** ack a write to the user that the projection didn't capture, because the next read would silently roll back.
+- **Invalidate after the projection write.** The order matters: if invalidation happens before projection write, a concurrent read repopulates L2 from the **stale** L3 row. Invalidate-after-write closes the window.
+- **SignalR last.** Real-time notification is a courtesy, not a correctness mechanism. Treat it as best-effort; the UI's polling fallback (every 60s for the visible grid) catches anything SignalR drops.
+
+### Idempotency
+
+Every command carries an `IdempotencyKey` header (UUID, client-generated). The handler:
+
+1. Looks up `(MspId, IdempotencyKey)` in `CommandIdempotency`.
+2. If hit and complete: return the original result.
+3. If hit and pending: return 409 with `Retry-After`.
+4. If miss: insert the row, proceed.
+
+This survives client retries without double-creating users / policies / etc. CIPP has no equivalent — its retry semantics are a function of whatever Azure Function host happens to do, which means duplicate `addUser` invocations under load.
+
+### Bulk writes
+
+Bulk operations (e.g., bulk license assignment, bulk user creation) **never** become 1,000 sequential Graph calls. They are:
+
+1. Validated and **decomposed into Graph batch requests** (max 20 per batch, per Microsoft's limit) on the API node.
+2. Per batch: dispatched, every subresponse status inspected, partial success captured.
+3. Per batch: results streamed back through SignalR with `{ index, status, error? }` so the UI shows row-level progress.
+4. The whole bulk is **one** audit record with line items, not 1,000 audit records.
+
+For very large bulks (>500 items), the API immediately enqueues a Hangfire job and returns `202 Accepted` with a poll URL; the SignalR stream replaces the poll for connected clients.
+
+### Compensating actions
+
+When Graph succeeds but the projection update fails, we **do not** roll back Graph. The Graph state is now reality; the projection is wrong. The handler:
+
+1. Logs the divergence with `log.Severity = Error, log.Category = "ProjectionDrift"`.
+2. Marks the audit row `succeeded-with-drift`.
+3. Enqueues a targeted refresh job for the affected `(tenant, resource, entityId)` so the projection re-syncs from Graph.
+4. Returns success to the user — the operation **happened**.
+
+Compensating Graph deletes after a partial failure are explicitly rejected: they introduce a new failure mode (the compensation itself can fail) and confuse audit history. The convention is: write through, log the drift, reconcile from upstream truth.
+
+### What writes never go through
+
+- **No client-driven cache pokes.** The frontend never tells the backend to invalidate a key. Invalidation is owned by the write handler.
+- **No "save and refresh page".** After a write, the SignalR broadcast updates the visible grid in place. The page does not reload.
+- **No write that bypasses the audit log.** If a code path doesn't write an audit row, it is not allowed to call Graph. This is enforced by the `IAuditingGraphInterceptor` registered on the SDK pipeline.
+
+---
