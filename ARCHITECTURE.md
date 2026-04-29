@@ -116,3 +116,109 @@ CIPP-API exposes **~300 HTTP endpoints + ~80 background functions** with no cont
 - Sub-resources are URL nesting, not new top-level endpoints.
 
 ---
+
+## 3. The cache hierarchy and read path
+
+This is the architectural centrepiece. Read it twice.
+
+### Why this exists
+
+CIPP's read path is forced into a binary choice:
+
+- **(a) Block-and-paginate** — page hit → request thread paginates Graph until done → render. Works at small scale; times out at 100+ tenants. Source of `#1064`, `#2883`.
+- **(b) Lazy paginate** — load each page on demand, no aggressive cache. Fast first paint, slow steady state, every page hit re-pays the Graph cost. Source of Discussion `#4979`.
+
+There is no third option for CIPP's architecture because there is no real backend. A JS frontend hydrating from a stateless PowerShell Function App has nowhere to share cache state across requests. Azure Tables / Blobs cannot provide TTL, invalidate, or pre-warm semantics that a real cache layer needs.
+
+The rebuild has a real backend, so the read path runs on a different model entirely: **the request thread never paginates Graph**. A background warmer does, on a schedule, using delta queries. Pages render from a local projection.
+
+### The four layers
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  L1 — IMemoryCache (per node)                                      │
+│  Lifetime: seconds–minutes                                         │
+│  Scope: single Web/API instance                                    │
+│  Use: hot reads inside a single request burst (tenant list per     │
+│       signed-in user, role lookup, MSP context object)             │
+└────────────────────────────────────────────────────────────────────┘
+                              ▲ miss
+┌────────────────────────────────────────────────────────────────────┐
+│  L2 — Redis (cluster-wide distributed cache)                       │
+│  Lifetime: minutes–hours                                           │
+│  Scope: every Web/API/Worker node                                  │
+│  Use: tenant lists, user lists, group lists, license SKUs, role    │
+│       definitions, recently fetched device records                 │
+│  Notes: stampede protection via SemaphoreSlim per cache key;       │
+│         keys versioned by schema rev so a deploy invalidates       │
+└────────────────────────────────────────────────────────────────────┘
+                              ▲ miss
+┌────────────────────────────────────────────────────────────────────┐
+│  L3 — PostgreSQL projection tables                                 │
+│  Lifetime: hours–days, refreshed on schedule + via Graph delta     │
+│  Scope: the canonical durable cache                                │
+│  Use: every cross-tenant grid (every user across every customer    │
+│       tenant; every Intune policy; every CA policy)                │
+│  Notes: typed columns, not JSON blobs; indexed for the queries     │
+│         the UI actually issues; partitioned by MspId                │
+└────────────────────────────────────────────────────────────────────┘
+                              ▲ miss / cold tenant
+┌────────────────────────────────────────────────────────────────────┐
+│  Graph — BACKGROUND ONLY for warm tenants                          │
+│           BOUNDED FALLBACK (one page) for cold tenants             │
+│  Notes: never paginate-until-done on a request thread              │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### Read-path resolution order
+
+For every "list X for tenant Y" query, the resolver does this:
+
+1. **L1 (`IMemoryCache`).** Return if hot.
+2. **L2 (Redis).** Return if present; backfill L1 with a short TTL.
+3. **L3 (Postgres projection).** Return if `last_synced_at` is within the freshness window for that resource type (e.g., users: 15 min, group memberships: 1 h, license SKUs: 24 h). Backfill L1 + L2.
+4. **Cold-tenant fallback.** If L3 has *zero* rows for `(MspId, CustomerTenantId, ResourceType)` — i.e., the tenant was just onboarded — the request is allowed to fall through to a **single bounded Graph page** (server-paginated, default 999 items) so the UI doesn't render an empty grid. Simultaneously, the resolver enqueues a warmer job to populate the rest. Subsequent reads hit L3.
+5. **Stale-but-not-cold.** If L3 has rows but `last_synced_at` is past the freshness window, the resolver returns the stale rows immediately and **kicks the warmer**. The UI footer shows "data refreshed N minutes ago" so users know the state. **Never block on the refresh.**
+
+### Freshness windows (defaults; overridable per-MSP)
+
+| Resource | L2 TTL | L3 freshness | Refresh cadence | Refresh mechanism |
+| -------- | ------ | ------------ | --------------- | ----------------- |
+| Tenants list (per MSP) | 5 min | 1 h | 15 min | Partner Center delta |
+| Users list | 1 min | 15 min | 15 min | Graph users delta |
+| Groups list | 5 min | 1 h | 1 h | Graph groups delta |
+| Group memberships | 5 min | 1 h | 1 h | Graph delta |
+| Devices (Entra) | 5 min | 1 h | 1 h | Graph delta |
+| Devices (Intune managed) | 5 min | 1 h | 1 h | Graph delta on managedDevices |
+| CA policies | 5 min | 6 h | 6 h | Full read (small list, no delta on CA) |
+| License SKUs | 1 h | 24 h | Daily | Full read |
+| Sign-in logs | 1 min | n/a (queried, not projected) | On demand | Live query against Graph with cursor pagination |
+| Audit log search | n/a | n/a | On demand | Saga; results land in projection on completion |
+
+`last_synced_at` lives on the parent (e.g., `CustomerTenantUserSync` row keyed by `(MspId, CustomerTenantId)`) and is updated transactionally with the projection rows. It is **not** computed from `MAX(updated_at)` — that conflates "I refreshed and saw nothing" with "I never refreshed."
+
+### Cache key conventions
+
+```
+tenant:{mspId}:{customerTenantId}:users:list                 # L2 list cache
+tenant:{mspId}:{customerTenantId}:users:{userId}             # L2 entity cache
+tenant:{mspId}:{customerTenantId}:users:delta-cursor         # delta token (Redis hot mirror; canonical row in Postgres GraphDeltaCursors)
+tenant:{mspId}:{customerTenantId}:groups:list
+tenant:{mspId}:{customerTenantId}:devices:list
+mspscope:{mspId}:tenants:list                                # MSP-level cache
+mspscope:{mspId}:user:{userObjectId}:context                 # logged-in MSP user context object
+schema:v{schemaRevision}                                     # appended to every key so deploys invalidate without flush
+```
+
+Keys are constructed by `IGraphCacheKey` factory methods, never concatenated by hand. The `schemaRevision` segment guarantees that a model change in a deploy doesn't serve stale shapes; old keys age out by TTL.
+
+### Anti-rules — codified in `CLAUDE.md` §8c
+
+- ❌ **No request-time pagination of Graph.** A handler that walks `nextLink` on the request thread is a bug.
+- ❌ **No "cache for a few minutes and call Graph anyway."** Either it's served from cache, or it triggers a refresh that updates the cache. There is no third path.
+- ❌ **No per-request token re-acquisition.** Tokens are cached in Redis with `SemaphoreSlim` coalescing; one fetch per `(MspId, CustomerTenantId, scope)` even under stampede.
+- ❌ **No "store the JSON blob and re-parse it on every read."** L3 is typed columns; the Graph response is not the persistence shape.
+
+This single rule eliminates the largest class of CIPP's user-facing performance complaints.
+
+---
