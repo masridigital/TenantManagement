@@ -32,3 +32,92 @@
 **Who is it for.** MSPs that operate delegated-admin against customer M365 tenants today and currently use (or have evaluated) CIPP. The rebuild's value-add is **caching, multi-tenant orchestration, the Standards engine, the UX, and the security posture** — not Graph proxying, which Microsoft already ships.
 
 ---
+
+## 2. The CIPP audit — full findings
+
+This section is the long-form audit. The shorter version is in `README.md`'s "Why this exists." If a finding here disagrees with a header summary elsewhere, this section is the source of truth.
+
+### 2.1 Repository inventory
+
+Two repositories make up CIPP:
+
+- **`KelvinTegelaar/CIPP`** — the frontend. Next.js 16 + React 19 + MUI 7. Statically exported and hosted on Azure Static Web Apps. Authentication is Azure Static Web Apps' EasyAuth, which carries identity headers to the function app. License AGPL-3.0.
+- **`KelvinTegelaar/CIPP-API`** — the backend. PowerShell 7.4 on Azure Functions v4. License AGPL-3.0.
+
+Together they form a "frontend hydrates by calling backend API; backend is a giant `if/else` over Microsoft Graph" architecture that has been the de-facto open-source MSP M365 portal since 2021.
+
+### 2.2 Backend findings
+
+**File and function structure**
+- **533 `Invoke-*.ps1` HTTP-trigger files** under `Modules/CIPPCore/Public/` — one file per endpoint, no controller registry, no routing table, no automated docs.
+- **187 standards files** — one per BPA/Standards rule, each with bespoke remediation logic. There is no shared base class or interface. The execution engine reflects on file names.
+- **Durable Functions** for orchestrations with strict version matching. A deploy whose orchestration version doesn't match the in-flight state nukes the orchestration; the project has shipped a user-facing **"Clear Durable Queue"** maintenance UI to mitigate.
+- **No DTO layer.** Inputs and outputs are PowerShell hashtables. Validation is per-file `if`-checks on `.Body.X` values.
+- **No global error handling.** Each file has its own `try/catch` style; some swallow exceptions, some don't.
+- **No typed test suite.** Pester tests exist in pockets but are not gating.
+
+**Data layer**
+- **Azure Table Storage** is the primary store. Templates, settings, BPA results, audit log, scheduler state — all in Tables.
+- The 64 KB per-row limit on Tables is a known production bug (**Issue `#1806`**, open since 2023). Templates that exceed the cap fail with a low-fidelity error.
+- **Blob Storage** holds binary artifacts and some larger-than-64-KB JSON payloads.
+- **No relational store.** No joins. No indexes beyond `PartitionKey`/`RowKey`. No foreign-key integrity.
+
+**Authentication**
+- A custom **SAM (Secure Application Model)** wrapper handles app registration and consent. The wrapper is necessary because PowerShell did not have first-class confidential-client identity primitives.
+- **Refresh tokens are mirrored into process environment variables** via the `Set-CIPPRefreshTokens` cmdlet. Any code path that reads `Env:RefreshToken` has access; the blast radius if any handler leaks env is the entire customer fleet.
+- A custom **`CIPP.CIPPTokenCache` shim compiled into `CIPPSharp.dll`** provides a process-local token cache.
+- Token acquisition is per-request. A burst of concurrent requests for the same `(tenant, scope)` can produce N concurrent STS round-trips.
+
+**Performance**
+- Documented **15–20 second cold start** in the project's own FAQ.
+- **100+ customer tenants → ≥ 15 minute BPA refresh** (Discussion `#4979`).
+- **All-tenants user list timeout** at scale (Issue `#2883`).
+- Throughput is bounded by Functions per-runspace module loads; under load, runspaces are recycled and the module reloads thrash.
+
+**Operations**
+- **Self-host-by-fork** distribution: every MSP forks the repo and pulls upstream. Major releases routinely break forks (their own release notes call this out as expected).
+- A central **CIPP-SAM** GitHub App handles tenant consent across the install base; one mis-step here has implications across hundreds of MSPs.
+- **No graceful deploy path** for in-flight Durable Function state — handled by the "Clear Durable Queue" UI mentioned above.
+
+### 2.3 Frontend findings
+
+- **Next.js 16 + React 19 + MUI 7**, statically exported. The static export is then hosted on SWA, which limits dynamic capabilities the modern Next runtime would otherwise provide.
+- **Toolbar files exceed 1,400 lines** in places. There is no consistent layout primitive. Component reuse is by copy.
+- **TypeScript adoption is partial.** Some files are `.tsx`; many are `.jsx` with `any`-shaped props.
+- **Forms libraries are mixed:** Formik in some places, react-hook-form in others, hand-rolled state in still more.
+- **No frontend test suite.** No Jest, no Vitest, no Playwright.
+- **Polling is the default real-time strategy.** No SignalR, no SSE, no WebSocket. The toll on the function app from polling at the install-base scale is non-trivial.
+- **EasyAuth headers** as the auth boundary: the frontend trusts what SWA injects. Token acquisition for downstream calls happens server-side in the function app.
+
+### 2.4 Pain points captured directly from issues / discussions
+
+- Issue **`#1064`** — perf at scale.
+- Issue **`#2883`** — all-tenants user list timeout.
+- Issue **`#75`** — perf complaints (long-running).
+- Discussion **`#4979`** — 60-tenant deployment perf complaints; the discussion explicitly notes "you can't really cache here because there's no real backend."
+- Issue **`#1806`** — 64 KB Table row limit on templates, unresolved since 2023.
+
+These are not edge cases — they trace to the architecture, not the code quality. A "fix" inside the current architecture is partial; a rewrite addresses the cause.
+
+### 2.5 Security posture
+
+- **AGPL-3.0** plus a publicly-advertised **$50 + swag bug-bounty** for a tool with delegated admin into every customer's M365.
+- Refresh tokens in environment variables (above).
+- No published `SECURITY.md` coordinated-disclosure process.
+- Tenant-token plumbing is ad-hoc per file.
+- Audit log is in Azure Tables, with the same 64 KB row limit and the same pagination characteristics.
+
+The blast radius of any compromise is the entire delegated install base across every MSP using CIPP. The posture does not match.
+
+### 2.6 What is good about CIPP
+
+A balanced audit acknowledges what works:
+
+- **Feature breadth.** CIPP covers an MSP's M365 admin surface end to end. The rebuild's feature inventory is openly informed by what CIPP ships today.
+- **Community.** The Discord and contributor base have institutional knowledge about real-world MSP M365 quirks that a clean-room rebuild benefits from acknowledging.
+- **Documentation tone.** CIPP's own docs are honest about limitations; the FAQ openly states the cold-start number, the perf-vs-completeness trade-off, and the fork-friction.
+- **GDAP plumbing.** Despite being in PowerShell, the GDAP-relationship handling is feature-complete and a useful reference for the rebuild's clean-room implementation.
+
+These do not change the structural verdict, but they shape **how** the rebuild is positioned: a respectful successor, not a replacement-by-disparagement.
+
+---
